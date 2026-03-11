@@ -404,6 +404,8 @@ def _classes_needed(present: str, total: str, target: float = 75.0) -> int | Non
     try:
         p = int(re.sub(r"\D", "", present))
         t = int(re.sub(r"\D", "", total))
+        if t == 0:
+            return None
         if p / t >= target / 100:
             return 0
         needed = 0
@@ -414,25 +416,52 @@ def _classes_needed(present: str, total: str, target: float = 75.0) -> int | Non
         return None
 
 
+def _classes_can_skip(present: str, total: str, target: float = 75.0) -> int | None:
+    """How many classes can be skipped while staying at or above `target`%."""
+    try:
+        p = int(re.sub(r"\D", "", present))
+        t = int(re.sub(r"\D", "", total))
+        if t == 0 or p / t < target / 100:
+            return 0
+        can_skip = 0
+        while t + can_skip + 1 > 0 and p / (t + can_skip + 1) >= target / 100:
+            can_skip += 1
+        return can_skip
+    except Exception:
+        return None
+
+
 def fetch_attendance(session: requests.Session) -> list | None:
+    """
+    Scrapes the SIU consolidated attendance report.
+    Known table structure (from live page):
+      Col 0: Course Name
+      Col 1: Total Sessions
+      Col 2: Marked Sessions   (same as Total in practice — sessions where attendance was taken)
+      Col 3: Attended Sessions (classes the student actually attended)
+      Col 4: Percentage
+    Footer rows contain summary text ("Total Conducted Session", "Total Percentage") — skipped.
+    """
     try:
         r    = session.get(ATTENDANCE_URL, timeout=25)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Redirect-to-login check (don't use r.url comparison — redirects may vary)
         if soup.find(id="loginerrormessage") or soup.find(class_="loginerrormessage"):
             print("  ⚠️  Attendance page redirected to login.")
             return None
 
-        records = []
+        records     = []
+        total_conducted = None
+        total_attended  = None
+        total_pct       = None
 
-        # ── Strategy A: HTML <table> ─────────────────────────────────
         table = soup.find("table")
         if table:
             raw_headers = [th.get_text(strip=True) for th in table.find_all("th")]
-            print(f"  📋 Attendance table headers: {raw_headers}")
+            print(f"  📋 Headers detected: {raw_headers}")
             headers_lower = [h.lower() for h in raw_headers]
 
+            # ── Map columns from headers ──────────────────────────────
             def col_idx(*keys):
                 for k in keys:
                     for i, h in enumerate(headers_lower):
@@ -440,145 +469,85 @@ def fetch_attendance(session: requests.Session) -> list | None:
                             return i
                 return -1
 
-            idx_subj    = col_idx("subject", "course", "name", "paper", "module")
-            idx_present = col_idx("present", "attended", "held")
-            idx_absent  = col_idx("absent", "missed")
-            idx_total   = col_idx("total", "conducted", "classes", "held")
-            idx_pct     = col_idx("percent", "%", "attendance", "ratio")
+            # Primary detection from known header keywords
+            idx_subj     = col_idx("course", "subject", "name", "paper", "module")
+            idx_total    = col_idx("total session", "total conducted", "total classes", "total")
+            idx_marked   = col_idx("marked")
+            idx_attended = col_idx("attended session", "attended")
+            idx_pct      = col_idx("percentage", "percent", "attendance %", "%")
 
-            print(f"  📋 Col indices → subj:{idx_subj} present:{idx_present} absent:{idx_absent} total:{idx_total} pct:{idx_pct}")
+            # Fallback: if can't detect from headers, use known fixed positions
+            # (based on confirmed live page structure)
+            if idx_subj < 0:     idx_subj     = 0
+            if idx_total < 0:    idx_total    = 1
+            if idx_attended < 0: idx_attended = 3
+            if idx_pct < 0:      idx_pct      = 4
 
-            # Collect all data rows first to detect subject column by content
-            all_rows_cells = []
-            for tr in table.find_all("tr")[1:]:
-                cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if cells and len(cells) >= 2:
-                    all_rows_cells.append(cells)
+            print(f"  📋 Using cols → name:{idx_subj} total:{idx_total} attended:{idx_attended} pct:{idx_pct}")
 
-            # If subject column not found by header, find it by content:
-            # The subject column has the most alphabetic/non-numeric text
-            if idx_subj < 0 and all_rows_cells:
-                num_cols = max(len(r) for r in all_rows_cells)
-                alpha_scores = []
-                for ci in range(num_cols):
-                    col_vals = [r[ci] for r in all_rows_cells if ci < len(r)]
-                    # Score = average ratio of alpha chars; skip % columns
-                    score = sum(
-                        sum(1 for c in v if c.isalpha()) / max(len(v), 1)
-                        for v in col_vals
-                    ) / max(len(col_vals), 1)
-                    alpha_scores.append(score)
-                idx_subj = alpha_scores.index(max(alpha_scores))
-                print(f"  📋 Subject col auto-detected at index {idx_subj} (alpha scores: {[f'{s:.2f}' for s in alpha_scores]})")
+            for tr in table.find_all("tr")[1:]:  # skip header row
+                # Get each <td> text individually — critical to NOT use tr.get_text()
+                tds   = tr.find_all("td")
+                if not tds:
+                    continue
+                cells = [td.get_text(strip=True) for td in tds]
 
-            # If pct column not found by header, find it by content:
-            # The pct column's cells all match \d+(\.\d+)?%
-            if idx_pct < 0 and all_rows_cells:
-                num_cols = max(len(r) for r in all_rows_cells)
-                for ci in range(num_cols):
-                    col_vals = [r[ci] for r in all_rows_cells if ci < len(r)]
-                    pct_hits = sum(1 for v in col_vals if re.match(r"^\d+(\.\d+)?%?$", v) and float(re.sub(r"[^\d.]","",v) or 0) <= 100)
-                    if pct_hits >= len(col_vals) * 0.7:   # 70% of rows look like percentages
-                        idx_pct = ci
-                        print(f"  📋 Pct col auto-detected at index {idx_pct}")
-                        break
+                # Skip rows with fewer cells than expected (colspan summary rows)
+                if len(cells) < 3:
+                    continue
 
-            for cells in all_rows_cells:
-                def cell(idx):
-                    return cells[idx] if 0 <= idx < len(cells) else "—"
+                # ── Grab subject name cleanly from its own <td> ───────
+                subj = cells[idx_subj] if idx_subj < len(cells) else ""
 
-                subj    = cell(idx_subj)    if idx_subj    >= 0 else "—"
-                present = cell(idx_present) if idx_present >= 0 else "—"
-                absent  = cell(idx_absent)  if idx_absent  >= 0 else "—"
-                total   = cell(idx_total)   if idx_total   >= 0 else "—"
-                pct_raw = cell(idx_pct)     if idx_pct     >= 0 else "—"
+                # Skip footer/summary rows
+                if not subj or re.search(r"total|grand|summary|conducted|session", subj, re.I):
+                    # But capture summary data for the overall footer
+                    row_text = tr.get_text(" ", strip=True)
+                    m_total  = re.search(r"conducted[^\d]*(\d+)", row_text, re.I)
+                    m_att    = re.search(r"attended[^\d]*(\d+)", row_text, re.I)
+                    m_pct2   = re.search(r"(\d+\.?\d*)\s*%", row_text)
+                    if m_total:  total_conducted = int(m_total.group(1))
+                    if m_att:    total_attended  = int(m_att.group(1))
+                    if m_pct2:   total_pct       = float(m_pct2.group(1))
+                    continue
 
-                # If pct_raw doesn't look like a number, search all cells for one
+                # Skip pure-number subject names (malformed rows)
+                if re.match(r"^\d+$", subj):
+                    continue
+
+                total    = cells[idx_total]    if idx_total    < len(cells) else "—"
+                attended = cells[idx_attended] if idx_attended < len(cells) else "—"
+                pct_raw  = cells[idx_pct]      if idx_pct      < len(cells) else "—"
+
+                # Clean percentage
                 pct = _pct_float(pct_raw)
+                # Fallback: compute from attended/total if pct missing
                 if pct is None:
-                    for v in cells:
-                        candidate = _pct_float(v)
-                        if candidate is not None and 0 <= candidate <= 100:
-                            pct = candidate
-                            pct_raw = v
-                            break
+                    t = _pct_float(total)
+                    a = _pct_float(attended)
+                    if t and a and t > 0:
+                        pct = round(a / t * 100, 2)
 
-                if subj and subj not in ("—", "") and not subj.isdigit():
-                    records.append({
-                        "subject":    subj,
-                        "present":    present,
-                        "absent":     absent,
-                        "total":      total,
-                        "percentage": f"{pct:.1f}%" if pct is not None else pct_raw,
-                        "pct_float":  pct,
-                        "status":     _status(pct),
-                    })
+                records.append({
+                    "subject":    subj.strip(),
+                    "attended":   attended,        # sessions actually attended
+                    "total":      total,           # total sessions conducted
+                    "percentage": f"{pct:.2f}%" if pct is not None else pct_raw,
+                    "pct_float":  pct,
+                    "status":     _status(pct),
+                })
 
-        # ── Strategy B: card/div layout ──────────────────────────────
         if not records:
-            print("  📋 No table records — trying div/card layout.")
-            for card in soup.select(".attendance-card, .subject-row, [class*='attend']"):
-                text  = card.get_text(" ", strip=True)
-                m_pct = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
-                name  = (
-                    card.select_one(".subject-name, .course-name, h3, h4, strong")
-                    or card
-                )
-                subj = name.get_text(strip=True)[:60]
-                pct  = float(m_pct.group(1)) if m_pct else None
-                records.append({
-                    "subject":    subj,
-                    "present":    "—",
-                    "absent":     "—",
-                    "total":      "—",
-                    "percentage": f"{pct:.1f}%" if pct else "—",
-                    "pct_float":  pct,
-                    "status":     _status(pct),
-                })
+            print("  ⚠️  No table records found.")
+            return None
 
-        # ── Strategy C: brute-force percentage hunt ───────────────────
-        # If we got records but subjects are all digits, page has a weird layout
-        # Try to find subject names from nearby text around % values
-        if not records or all(r["subject"].isdigit() for r in records):
-            print("  📋 Falling back to Strategy C — brute-force % search.")
-            records = []
-            seen_pcts = set()
-            for tag in soup.find_all(string=re.compile(r"\d+\.?\d*\s*%")):
-                m = re.search(r"(\d+\.?\d*)\s*%", tag)
-                if not m:
-                    continue
-                pct = float(m.group(1))
-                if pct > 100 or round(pct, 2) in seen_pcts:
-                    continue
-                seen_pcts.add(round(pct, 2))
-
-                # Walk up DOM looking for subject name
-                subj = "Unknown"
-                node = tag.parent
-                for _ in range(6):
-                    if node is None:
-                        break
-                    # Look for a sibling or child that has alpha text
-                    candidate = node.get_text(" ", strip=True)
-                    # Strip the pct itself
-                    candidate = re.sub(r"\d+\.?\d*\s*%", "", candidate).strip()
-                    if len(candidate) > 5 and any(c.isalpha() for c in candidate):
-                        subj = candidate[:60]
-                        break
-                    node = node.parent
-
-                records.append({
-                    "subject":    subj,
-                    "present":    "—",
-                    "absent":     "—",
-                    "total":      "—",
-                    "percentage": f"{pct:.1f}%",
-                    "pct_float":  pct,
-                    "status":     _status(pct),
-                })
-
-        print(f"  📋 Final record count: {len(records)}")
-        return records or None
+        print(f"  📋 {len(records)} subject records parsed.")
+        return {
+            "records":          records,
+            "total_conducted":  total_conducted,
+            "total_attended":   total_attended,
+            "total_pct":        total_pct,
+        }
 
     except Exception as ex:
         import traceback
@@ -623,15 +592,19 @@ def send_announcements_to_discord(webhook: str, subject: dict, posts: list) -> N
 
     embeds = [header]
     for post in posts[:9]:
+        fields = []
+        if post["author"] not in ("Unknown", "", "—"):
+            fields.append({"name": "👤 Author",  "value": post["author"],   "inline": True})
+        if post["date_str"] != "Unknown date":
+            fields.append({"name": "📅 Posted",  "value": post["date_str"], "inline": True})
+        if post["replies"] not in ("—", ""):
+            fields.append({"name": "💬 Replies", "value": post["replies"],  "inline": True})
+
         embeds.append({
-            "title":  f"📢 {post['title']}",
-            "url":    post["url"],
-            "color":  subject["color"],
-            "fields": [
-                {"name": "👤 Author",  "value": post["author"],   "inline": True},
-                {"name": "📅 Posted",  "value": post["date_str"], "inline": True},
-                {"name": "💬 Replies", "value": post["replies"],  "inline": True},
-            ],
+            "title":     f"📢 {post['title']}",
+            "url":       post["url"],
+            "color":     subject["color"],
+            "fields":    fields if fields else [{"name": "🔗 Link", "value": post["url"], "inline": False}],
             "footer":    {"text": f"{subject['emoji']} {subject['name']} • LMS Notifier"},
             "timestamp": datetime.utcnow().isoformat() + "Z",
         })
@@ -643,13 +616,13 @@ def send_announcements_to_discord(webhook: str, subject: dict, posts: list) -> N
     print(f"  ✅ {subject['code']}: sent {len(posts)} post(s).")
 
 
-def send_attendance_to_discord(records: list | None) -> None:
+def send_attendance_to_discord(data: dict | None) -> None:
     if not ATTENDANCE_WEBHOOK:
         print("⚠️  WEBHOOK_ATTENDANCE not set — skipping.")
         return
 
     # ── Fetch failed ─────────────────────────────────────────────
-    if records is None:
+    if data is None:
         _post(ATTENDANCE_WEBHOOK, {"embeds": [{
             "title":       "📋 Attendance — Fetch Failed",
             "description": (
@@ -662,22 +635,34 @@ def send_attendance_to_discord(records: list | None) -> None:
         }]})
         return
 
-    # ── Sort: lowest % first (most urgent) ───────────────────────
+    records         = data["records"]
+    total_conducted = data.get("total_conducted")
+    total_attended  = data.get("total_attended")
+    total_pct       = data.get("total_pct")
+
+    # ── Sort: lowest % first (most urgent up top) ────────────────
     records.sort(key=lambda r: r["pct_float"] if r["pct_float"] is not None else 999)
 
-    # ── Build fields ─────────────────────────────────────────────
+    # ── Build per-subject fields ──────────────────────────────────
     fields = []
     for rec in records[:25]:   # Discord max 25 fields
-        pct   = rec["pct_float"]
-        lines = [f"{rec['status']}  **{rec['percentage']}**"]
+        pct  = rec["pct_float"]
+        att  = rec["attended"]
+        tot  = rec["total"]
 
-        if rec["present"] != "—":
-            lines.append(f"Present: **{rec['present']}** / {rec['total']}  |  Absent: {rec['absent']}")
+        lines = [f"{rec['status']}  **{rec['percentage']}**  ({att} / {tot} classes)"]
 
+        # How many classes needed to hit 75%?
         if pct is not None and pct < 75:
-            needed = _classes_needed(rec["present"], rec["total"])
+            needed = _classes_needed(att, tot, target=75.0)
             if needed is not None:
-                lines.append(f"Need **{needed}** more class(es) to hit 75%")
+                lines.append(f"⚠️ Need **{needed}** more class(es) to reach 75%")
+
+        # How many can be safely skipped while staying ≥ 75%?
+        if pct is not None and pct >= 75:
+            can_skip = _classes_can_skip(att, tot, target=75.0)
+            if can_skip and can_skip > 0:
+                lines.append(f"✅ Can afford to skip **{can_skip}** class(es)")
 
         fields.append({
             "name":   rec["subject"][:50],
@@ -685,33 +670,40 @@ def send_attendance_to_discord(records: list | None) -> None:
             "inline": False,
         })
 
-    # ── Summary stats ─────────────────────────────────────────────
+    # ── Summary header ────────────────────────────────────────────
     pct_vals   = [r["pct_float"] for r in records if r["pct_float"] is not None]
     avg_pct    = sum(pct_vals) / len(pct_vals) if pct_vals else 0
     low_count  = sum(1 for p in pct_vals if p < 75)
     border     = sum(1 for p in pct_vals if 75 <= p < 85)
     safe_count = sum(1 for p in pct_vals if p >= 85)
-
     top_color  = 0xE74C3C if low_count else (0xF39C12 if border else 0x2ECC71)
 
+    # Overall totals from footer (if scraped), else compute from records
+    if total_conducted and total_attended:
+        overall_line = f"📚 Total: **{total_attended} / {total_conducted}** sessions"
+        overall_pct  = total_pct or (round(total_attended / total_conducted * 100, 1))
+        overall_line += f"  →  **{overall_pct:.1f}%**"
+    else:
+        overall_line = f"📊 Avg across subjects: **{avg_pct:.1f}%**"
+
     summary = (
-        f"📊 **Overall average:** {avg_pct:.1f}%\n"
-        f"🔴 Low (<75%): {low_count}   "
-        f"🟡 Borderline (75–84%): {border}   "
-        f"🟢 Safe (≥85%): {safe_count}"
+        f"{overall_line}\n"
+        f"🔴 Low (<75%): **{low_count}**  •  "
+        f"🟡 Borderline (75–84%): **{border}**  •  "
+        f"🟢 Safe (≥85%): **{safe_count}**"
     )
 
     embed = {
-        "title":       "📋 Attendance Report",
+        "title":       "📋 Attendance Report — SIU Hyderabad",
         "description": summary,
         "color":       top_color,
         "fields":      fields,
-        "footer":      {"text": "Attendance Bot • SIU Hyderabad"},
+        "footer":      {"text": f"Attendance Bot • SIU Hyderabad • {datetime.now().strftime('%d %b %Y, %I:%M %p')}"},
         "timestamp":   datetime.utcnow().isoformat() + "Z",
     }
 
     _post(ATTENDANCE_WEBHOOK, {"embeds": [embed]})
-    print(f"✅ Attendance sent — {len(records)} subjects, avg {avg_pct:.1f}%.")
+    print(f"✅ Attendance sent — {len(records)} subjects.")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -753,9 +745,10 @@ def main():
 
     if run_attendance:
         print("\n📋 Scraping attendance...")
-        records = fetch_attendance(session)
-        print(f"  🔍 {len(records) if records else 0} records found.")
-        send_attendance_to_discord(records)
+        att_data = fetch_attendance(session)
+        count = len(att_data["records"]) if att_data else 0
+        print(f"  🔍 {count} subject records found.")
+        send_attendance_to_discord(att_data)
 
     print("\n" + "=" * 60)
     print(f"✅ Finished — {total_new} announcement(s) dispatched.")
