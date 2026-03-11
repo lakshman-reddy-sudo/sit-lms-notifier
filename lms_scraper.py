@@ -248,7 +248,8 @@ def _extract_body_with_linebreaks(tag) -> str:
 def fetch_post_full(session: requests.Session, post_url: str) -> tuple[str, str, str]:
     """
     Returns (author, date_str, body_with_linebreaks).
-    Author and date always come from the post page for accuracy.
+    Tries many selectors and falls back to the full page body.
+    Debug prints show exactly which selector matched.
     """
     try:
         r    = session.get(post_url, timeout=REQUEST_TIMEOUT)
@@ -257,8 +258,7 @@ def fetch_post_full(session: requests.Session, post_url: str) -> tuple[str, str,
         # ── Author ────────────────────────────────────────────────
         author = "Unknown"
         for sel in [
-            "address.author a",
-            ".forumpost .author a",
+            "address.author a", ".forumpost .author a",
             "[data-region='post'] .username",
             ".author a", ".username a", ".fullname",
         ]:
@@ -270,12 +270,9 @@ def fetch_post_full(session: requests.Session, post_url: str) -> tuple[str, str,
         # ── Date ─────────────────────────────────────────────────
         date_str = "Unknown date"
         for sel in [
-            "address.author time",
-            ".forumpost .author time",
-            "time[datetime]",
-            ".forumpost .date",
-            "[data-region='post'] .date",
-            ".posted",
+            "address.author time", ".forumpost .author time",
+            "time[datetime]", ".forumpost .date",
+            "[data-region='post'] .date", ".posted",
         ]:
             tag = soup.select_one(sel)
             if tag:
@@ -288,36 +285,62 @@ def fetch_post_full(session: requests.Session, post_url: str) -> tuple[str, str,
                     date_str = raw.strip()[:40]
                     break
 
-        # ── Body with line breaks ─────────────────────────────────
+        # ── Body — try specific selectors first, then broad fallback ──
         body = ""
-        for sel in [
+        BODY_SELECTORS = [
             ".posting",
             "[data-region='post-content-container']",
             ".post-content-container",
             ".forumpost .content .no-overflow",
             ".forumpost .posting",
+            ".forumpost .post-content",
             "div.message",
-            # Additional selectors for SIU Moodle theme
             ".post-content",
-            ".forumpost",
             "article.forumpost",
             "[data-region='post']",
             ".discussionview .content",
-            "#page-content",
-        ]:
+            ".forumpost",
+        ]
+        for sel in BODY_SELECTORS:
             tag = soup.select_one(sel)
             if tag:
-                body = _extract_body_with_linebreaks(tag)
-                if len(body) > 20:
+                candidate = _extract_body_with_linebreaks(tag)
+                if len(candidate) > 20:
+                    body = candidate
+                    print(f"      📝 Body matched via: {sel} ({len(body)} chars)")
                     break
 
-        # Last resort: grab the main content div and strip nav/header noise
+        # Broad fallback: grab #region-main and strip all nav/UI chrome
         if not body:
-            main = soup.select_one("#region-main") or soup.select_one("main") or soup.select_one(".main-inner")
+            main = (
+                soup.select_one("#region-main")
+                or soup.select_one("div[role='main']")
+                or soup.select_one("main")
+                or soup.select_one(".main-inner")
+                or soup.find("body")
+            )
             if main:
-                for noise in main.find_all(["nav", "header", "footer", "aside", "form"]):
+                # Remove all structural/nav elements
+                for noise in main.find_all([
+                    "nav", "header", "footer", "aside", "form",
+                    "script", "style", "noscript",
+                ]):
                     noise.decompose()
+                # Also remove breadcrumbs, reply form, etc.
+                for noise_sel in [
+                    ".breadcrumb", "#page-header", ".header",
+                    ".forum-post-container .forumpost:not(:first-child)",
+                    ".reply", ".discussion-nav",
+                ]:
+                    for el in main.select(noise_sel):
+                        el.decompose()
                 body = _extract_body_with_linebreaks(main)
+                if len(body) > 20:
+                    print(f"      📝 Body via broad fallback ({len(body)} chars)")
+                else:
+                    # Nuclear last resort: just get all visible text
+                    body = re.sub(r"\s+", " ", main.get_text(" ", strip=True)).strip()
+                    print(f"      📝 Body via get_text fallback ({len(body)} chars)")
 
         return author, date_str, body
 
@@ -432,18 +455,19 @@ def _classes_can_skip(present: str, total: str, target: float = 75.0) -> int | N
 
 def _parse_attendance_table(soup: BeautifulSoup) -> dict | None:
     """
-    Handles BOTH table orientations used by SIU LMS:
+    SIU LMS table structure (confirmed from live logs):
 
-    NORMAL (row-per-subject):
-        <tr><th>Course</th><th>Total</th><th>Attended</th><th>%</th></tr>
-        <tr><td>LinearAlg</td><td>17</td><td>7</td><td>41%</td></tr>
-        ...
+    ONE header <tr> with ALL <th>:
+      [Course Name, Total Sessions, Marked Sessions, Attended Sessions, Percentage,
+       Subject1, Subject2, ... SubjectN]
 
-    TRANSPOSED (col-per-subject) — confirmed from live logs:
-        <tr><th>Course Name</th><th>Total</th><th>Attended</th><th>%</th>
-            <th>Linear Algebra</th><th>Micro...</th>...</tr>
-        <tr><td>...</td><td>17</td><td>7</td><td>41%</td>...</tr>
-        — i.e. subjects are <th> in the header row, data in ONE <td> row
+    Followed by N data <tr>, each with ONLY <td> (no subject name in td):
+      [total, marked, attended, pct]   ← row 1 = Subject1
+      [total, marked, attended, pct]   ← row 2 = Subject2
+      ...
+
+    So we zip header_ths[5:] with data_rows to build records.
+    Falls back to regex on page text if HTML parsing fails.
     """
     table = soup.find("table")
     if not table: return None
@@ -451,216 +475,143 @@ def _parse_attendance_table(soup: BeautifulSoup) -> dict | None:
     all_rows = table.find_all("tr")
     if not all_rows: return None
 
-    # Collect ALL th texts from the entire table
-    all_th = [th.get_text(strip=True) for th in table.find_all("th")]
-    print(f"  📋 All <th>: {all_th}")
+    # ── Extract header <th> list ──────────────────────────────────
+    header_ths = [th.get_text(strip=True) for th in all_rows[0].find_all("th")]
+    print(f"  📋 Header ths ({len(header_ths)}): {header_ths}")
 
-    records = []
-    total_conducted = total_attended = total_pct = None
-
-    # ── Detect orientation ────────────────────────────────────────
-    # If the first row has BOTH metric names AND subject names as <th>,
-    # it's the transposed layout.
-    first_row_ths = [th.get_text(strip=True) for th in all_rows[0].find_all("th")]
-    metric_names  = {"course", "total", "marked", "attended", "percentage", "percent", "%"}
-    has_metrics   = any(any(m in h.lower() for m in metric_names) for h in first_row_ths)
-    has_subjects  = len(first_row_ths) > 5  # more than just metric headers = subjects too
-
-    if has_metrics and has_subjects:
-        # ── TRANSPOSED layout ─────────────────────────────────────
-        # Header row: [Course Name, Total, Marked, Attended, %, Subj1, Subj2, ...]
-        # Data row(s): [<empty>, val1, val2, val3, val4, ...]  (one row = one set of values per subject)
-        # BUT actually each subject is a column — so we need to pivot:
-        # Find the index of each metric in the header
-        print("  📋 Detected TRANSPOSED table layout")
-
-        def hdr_idx(*keys):
-            for k in keys:
-                for i, h in enumerate(first_row_ths):
-                    if k.lower() in h.lower(): return i
-            return -1
-
-        idx_total    = hdr_idx("total session", "total conducted", "total")
-        idx_marked   = hdr_idx("marked")
-        idx_attended = hdr_idx("attended session", "attended")
-        idx_pct      = hdr_idx("percentage", "percent", "%")
-        # Subjects start after the metric columns
-        # Find where subject names start (first th that doesn't match metric names)
-        subj_start = -1
-        for i, h in enumerate(first_row_ths):
-            if not any(m in h.lower() for m in metric_names):
-                subj_start = i
-                break
-
-        print(f"  📋 Metric cols → total:{idx_total} attended:{idx_attended} pct:{idx_pct} | subjects start at col:{subj_start}")
-
-        if subj_start < 0 or idx_attended < 0:
-            print("  ⚠️  Could not identify columns in transposed table.")
-            return None
-
-        subjects = first_row_ths[subj_start:]
-
-        # Each data row contains values for all subjects at that column position
-        # Because it's transposed: row=metric, col=subject
-        # We need to read column-by-column, not row-by-row
-        # Collect all td values from data rows into a 2D grid
-        data_rows = [tr for tr in all_rows[1:] if tr.find("td")]
-        if not data_rows:
-            print("  ⚠️  No data rows found in transposed table.")
-            return None
-
-        # Build grid: grid[row_idx][col_idx] = cell text
-        grid = []
-        for tr in data_rows:
-            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-            grid.append(cells)
-
-        print(f"  📋 Grid: {len(grid)} rows x {len(grid[0]) if grid else 0} cols")
-
-        # In the transposed layout there's typically ONE data row
-        # with values for all subjects side by side
-        # grid[0][0..n] = [val_for_subj0, val_for_subj1, ...]
-        # But the metric cols (total/attended/pct) in the header map to
-        # positions in each td row offset by (subj_start - number of leading td cols)
-        # Simpler: parse text directly from the snippet we know works
-        # The snippet shows: "Subject total total attended pct Subject total..."
-        # So let's just read row by row with metric header alignment:
-
-        # Each subject gets one column. The td row has one cell per subject.
-        # But we have multiple metric rows OR a single row with all values.
-        # From the log snippet: "Linear Algebra ... 17 17 7 41.18%  Micro ... 19 19 14 73.68%"
-        # This suggests the entire table is linearised in the page text.
-        # The actual HTML is likely:
-        #   Row 1 (all th): Course|Total|Marked|Attended|%|Subj1|Subj2|...
-        #   Row 2 (all td): empty | 17  |  17  |   7    |41%| 19 | 19 |...
-        # Where td[0] is empty (Course Name col), td[1]=total_subj1, etc.
-        # But that doesn't match the header count properly.
-        #
-        # Most likely layout from SIU:
-        # VERTICAL table where each ROW = one subject, but subjects are <th> not <td>
-        # Row structure: <tr><th>Subject Name</th><td>17</td><td>17</td><td>7</td><td>41.18%</td></tr>
-
-        # Let's check if subjects are row-headers (th in each row, not just header row)
-        subj_rows = [tr for tr in all_rows if tr.find("th") and tr.find("td")]
-        if subj_rows:
-            print(f"  📋 Found {len(subj_rows)} rows with both th and td — subject-as-row-header layout")
-            for tr in subj_rows:
-                subj = tr.find("th").get_text(strip=True)
-                if re.search(r"course name|total session|marked|attended session|percentage", subj, re.I):
-                    continue  # skip metric header rows
-                cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if len(cells) < 3: continue
-
-                # Map by header position: find which td index = attended, total, pct
-                # Use idx_total/attended/pct but offset since th takes col 0
-                t_val   = cells[idx_total    - 1] if idx_total    > 0 and idx_total    - 1 < len(cells) else (cells[0] if cells else "—")
-                a_val   = cells[idx_attended - 1] if idx_attended > 0 and idx_attended - 1 < len(cells) else (cells[2] if len(cells) > 2 else "—")
-                pct_raw = cells[idx_pct      - 1] if idx_pct      > 0 and idx_pct      - 1 < len(cells) else (cells[3] if len(cells) > 3 else "—")
-
-                pct = _pct_float(pct_raw)
-                if pct is None:
-                    tf, af = _pct_float(t_val), _pct_float(a_val)
-                    if tf and af and tf > 0: pct = round(af / tf * 100, 2)
-
-                records.append({
-                    "subject":    subj.strip(),
-                    "attended":   a_val,
-                    "total":      t_val,
-                    "percentage": f"{pct:.1f}%" if pct is not None else pct_raw,
-                    "pct_float":  pct,
-                    "status":     _status(pct),
-                })
-            if records:
-                return {"records": records, "total_conducted": None, "total_attended": None, "total_pct": None}
-
-        # Last resort: parse directly from page text using regex
-        print("  📋 Falling back to regex parse from page text")
-        page_text = soup.get_text(" ", strip=True)
-        # Pattern: subject name followed by numbers and a percentage
-        pattern = re.compile(
-            r"([A-Za-z][A-Za-z0-9 &,()\-/]+?\([A-Za-z0-9_ ]+\))"  # subject name with (semester)
-            r"\s+(\d+)\s+\d+\s+(\d+)\s+([\d.]+%)",
-            re.I
-        )
-        for m in pattern.finditer(page_text):
-            subj    = m.group(1).strip()
-            total   = m.group(2)
-            attended = m.group(3)
-            pct_raw = m.group(4)
-            pct = _pct_float(pct_raw)
-            records.append({
-                "subject":    subj,
-                "attended":   attended,
-                "total":      total,
-                "percentage": f"{pct:.1f}%" if pct is not None else pct_raw,
-                "pct_float":  pct,
-                "status":     _status(pct),
-            })
-
-    else:
-        # ── NORMAL layout (row-per-subject) ───────────────────────
-        print("  📋 Detected NORMAL table layout")
-        headers_lower = [h.lower() for h in first_row_ths]
-
-        def col_idx(*keys):
-            for k in keys:
-                for i, h in enumerate(headers_lower):
-                    if k in h: return i
-            return -1
-
-        idx_subj     = col_idx("course", "subject", "name", "paper", "module")
-        idx_total    = col_idx("total session", "total conducted", "total classes", "total")
-        idx_attended = col_idx("attended session", "attended")
-        idx_pct      = col_idx("percentage", "percent", "attendance %", "%")
-
-        if idx_subj     < 0: idx_subj     = 0
-        if idx_total    < 0: idx_total    = 1
-        if idx_attended < 0: idx_attended = 3
-        if idx_pct      < 0: idx_pct      = 4
-
-        for tr in all_rows[1:]:
-            tds = tr.find_all("td")
-            if not tds: continue
-            cells = [td.get_text(strip=True) for td in tds]
-            if len(cells) < 3: continue
-
-            subj = cells[idx_subj] if idx_subj < len(cells) else ""
-            if not subj or re.search(r"total|grand|summary|conducted|session", subj, re.I):
-                row_text = tr.get_text(" ", strip=True)
-                m = re.search(r"conducted[^\d]*(\d+)", row_text, re.I)
-                if m: total_conducted = int(m.group(1))
-                m = re.search(r"attended[^\d]*(\d+)", row_text, re.I)
-                if m: total_attended = int(m.group(1))
-                m = re.search(r"(\d+\.?\d*)\s*%", row_text)
-                if m: total_pct = float(m.group(1))
-                continue
-            if re.match(r"^\d+$", subj): continue
-
-            total    = cells[idx_total]    if idx_total    < len(cells) else "—"
-            attended = cells[idx_attended] if idx_attended < len(cells) else "—"
-            pct_raw  = cells[idx_pct]      if idx_pct      < len(cells) else "—"
-
-            pct = _pct_float(pct_raw)
-            if pct is None:
-                t_f, a_f = _pct_float(total), _pct_float(attended)
-                if t_f and a_f and t_f > 0: pct = round(a_f / t_f * 100, 2)
-
-            records.append({
-                "subject":    subj.strip(),
-                "attended":   attended,
-                "total":      total,
-                "percentage": f"{pct:.1f}%" if pct is not None else pct_raw,
-                "pct_float":  pct,
-                "status":     _status(pct),
-            })
-
-    if not records:
-        print("  ⚠️  0 records parsed from table.")
+    if not header_ths:
+        print("  ⚠️  No <th> in first row.")
         return None
 
-    print(f"  ✅ Parsed {len(records)} subject records.")
-    return {"records": records, "total_conducted": total_conducted,
-            "total_attended": total_attended, "total_pct": total_pct}
+    # ── Find where metric headers end and subject names begin ─────
+    metric_keywords = {"course", "total", "marked", "attended", "percentage", "percent", "%"}
+    subj_start = next(
+        (i for i, h in enumerate(header_ths)
+         if not any(k in h.lower() for k in metric_keywords)),
+        -1
+    )
+
+    if subj_start < 0:
+        print("  ⚠️  No subject column headers found in <th> row.")
+        return None
+
+    metric_ths = header_ths[:subj_start]   # e.g. [Course Name, Total, Marked, Attended, %]
+    subject_ths = header_ths[subj_start:]   # e.g. [Linear Algebra, Micro, ...]
+    print(f"  📋 Metric cols: {metric_ths}")
+    print(f"  📋 Subjects ({len(subject_ths)}): {subject_ths}")
+
+    # Find column indices within metric_ths
+    def midx(*keys):
+        for k in keys:
+            for i, h in enumerate(metric_ths):
+                if k.lower() in h.lower(): return i
+        return -1
+
+    # These are 0-based indices within each data row's <td> list
+    # data rows have NO subject td — just the metric values
+    # BUT the header has "Course Name" as first metric col (idx 0),
+    # so data rows may start from td[0]=total or td[0] may be empty/subject ref
+    # We'll detect by checking if first td is numeric
+
+    idx_total    = midx("total session", "total conducted", "total")
+    idx_marked   = midx("marked")
+    idx_attended = midx("attended session", "attended")
+    idx_pct      = midx("percentage", "percent", "%")
+
+    # Subtract 1 because "Course Name" col has no td equivalent in data rows
+    # (subject name is implied by row order, not present as a td)
+    offset = 1  # Course Name col is th-only
+    idx_total    = max(0, idx_total    - offset) if idx_total    >= 0 else 0
+    idx_attended = max(0, idx_attended - offset) if idx_attended >= 0 else 2
+    idx_pct      = max(0, idx_pct      - offset) if idx_pct      >= 0 else 3
+
+    print(f"  📋 Data col indices → total:{idx_total} attended:{idx_attended} pct:{idx_pct}")
+
+    # ── Collect data rows (td-only rows, skip header) ─────────────
+    data_rows = []
+    for tr in all_rows[1:]:
+        tds = tr.find_all("td")
+        if tds:
+            data_rows.append([td.get_text(strip=True) for td in tds])
+
+    print(f"  📋 Data rows found: {len(data_rows)}")
+
+    if not data_rows:
+        print("  ⚠️  No <td> data rows found.")
+        return _parse_attendance_from_text(soup)
+
+    # ── Zip subjects with data rows ───────────────────────────────
+    records = []
+    for subj, cells in zip(subject_ths, data_rows):
+        if not cells: continue
+        total    = cells[idx_total]    if idx_total    < len(cells) else "—"
+        attended = cells[idx_attended] if idx_attended < len(cells) else "—"
+        pct_raw  = cells[idx_pct]      if idx_pct      < len(cells) else "—"
+
+        pct = _pct_float(pct_raw)
+        if pct is None:
+            t_f, a_f = _pct_float(total), _pct_float(attended)
+            if t_f and a_f and t_f > 0:
+                pct = round(a_f / t_f * 100, 2)
+
+        records.append({
+            "subject":    subj.strip(),
+            "attended":   attended,
+            "total":      total,
+            "percentage": f"{pct:.1f}%" if pct is not None else pct_raw,
+            "pct_float":  pct,
+            "status":     _status(pct),
+        })
+
+    if records:
+        print(f"  ✅ Parsed {len(records)} records via zip method.")
+        return {"records": records, "total_conducted": None,
+                "total_attended": None, "total_pct": None}
+
+    # ── Fallback: regex on page text ──────────────────────────────
+    print("  ⚠️  Zip method yielded 0 records — falling back to text regex.")
+    return _parse_attendance_from_text(soup)
+
+
+def _parse_attendance_from_text(soup: BeautifulSoup) -> dict | None:
+    """
+    Last-resort: parse attendance data directly from the page text.
+    Matches pattern: "Subject Name (semester) total marked attended pct%"
+    """
+    page_text = soup.get_text(" ", strip=True)
+    page_text = re.sub(r"\s+", " ", page_text)
+    print(f"  📋 Regex fallback on page text ({len(page_text)} chars)")
+
+    # Pattern: name ending with (semester info) then 3+ numbers then a percentage
+    pattern = re.compile(
+        r"([A-Za-z][A-Za-z0-9 ,&()\/\-]+"         # subject name
+        r"\([A-Za-z0-9_\s]+\))"                   # (semester)
+        r"\s+(\d+)\s+\d+\s+(\d+)\s+([\d.]+%)",  # total, marked, attended, pct
+        re.I
+    )
+    records = []
+    for m in pattern.finditer(page_text):
+        subj     = m.group(1).strip()
+        total    = m.group(2)
+        attended = m.group(3)
+        pct_raw  = m.group(4)
+        pct = _pct_float(pct_raw)
+        records.append({
+            "subject":    subj,
+            "attended":   attended,
+            "total":      total,
+            "percentage": f"{pct:.1f}%" if pct is not None else pct_raw,
+            "pct_float":  pct,
+            "status":     _status(pct),
+        })
+
+    if records:
+        print(f"  ✅ Regex fallback parsed {len(records)} records.")
+        return {"records": records, "total_conducted": None,
+                "total_attended": None, "total_pct": None}
+
+    print("  ❌ Regex fallback also found 0 records.")
+    return None
 
 
 def fetch_attendance(session: requests.Session) -> dict | None:
