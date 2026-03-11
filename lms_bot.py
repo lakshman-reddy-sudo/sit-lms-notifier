@@ -1,4 +1,5 @@
 import re
+import time
 import requests
 import json
 import os
@@ -28,8 +29,8 @@ TARGET_COURSES = {
     "Technical and Professional Communication Skills (CSE_II SEM)",
 }
 
-DISCORD_LIMIT    = 2000
-TRUNCATION_NOTE  = "\n\n... *(message truncated — check LMS for full content)*"
+DISCORD_LIMIT   = 2000
+TRUNCATION_NOTE = "\n\n... *(message truncated — check LMS for full content)*"
 
 session = requests.Session()
 
@@ -87,14 +88,34 @@ def get_sesskey():
 # ─── Timeline ─────────────────────────────────────────────────────────────────
 
 def fetch_timeline(sesskey):
-    url = f"{LMS_URL}/lib/ajax/service.php?sesskey={sesskey}"
+    """
+    On MANUAL runs  → fetch events from the past 7 days up to 30 days ahead.
+                      This surfaces recently-posted announcements that already
+                      passed or have no strict deadline.
+    On SCHEDULED runs → fetch only upcoming events (no timesortfrom), which
+                        is the default Moodle behaviour.
+    """
+    url  = f"{LMS_URL}/lib/ajax/service.php?sesskey={sesskey}"
+    now  = int(time.time())
+
+    args = {"limitnum": 50}
+
+    if MANUAL_RUN:
+        args["timesortfrom"] = now - (7 * 24 * 60 * 60)   # 7 days ago
+        args["timesortto"]   = now + (30 * 24 * 60 * 60)  # 30 days ahead
+        print("[INFO] Fetching events from the past 7 days + next 30 days.")
+    else:
+        # Scheduled: only look ahead so we catch new deadlines as they appear
+        args["timesortfrom"] = now - (60 * 60)             # 1 hr back (safety buffer)
+        args["timesortto"]   = now + (30 * 24 * 60 * 60)  # 30 days ahead
+        print("[INFO] Fetching upcoming events.")
+
     payload = [{
         "index": 0,
         "methodname": "core_calendar_get_action_events_by_timesort",
-        "args": {
-            "limitnum": 50
-        }
+        "args": args
     }]
+
     r = session.post(url, json=payload)
     r.raise_for_status()
     return r.json()
@@ -112,30 +133,23 @@ def clean_html(html):
     return clean.strip()
 
 
-def truncate_for_discord(text, reserved_chars):
-    """Trim text so the full message fits within Discord's 2000 char limit."""
-    available = DISCORD_LIMIT - reserved_chars - len(TRUNCATION_NOTE)
-    if len(text) > available:
-        return text[:available] + TRUNCATION_NOTE
-    return text
-
-
 def format_discord_msg(course, title, message, attachments, tag=""):
     header = f"📢  **LMS ANNOUNCEMENT — CSE II SEM**  {tag}".strip()
 
-    # Build the frame without the message body to measure its size
-    frame_without_body = (
+    # Measure frame size without body so we know how much space is left
+    frame_shell = (
         f"{header}\n\n\n"
         f"📚  **Course:**\n{course}\n\n\n"
         f"📌  **Title:**\n{title}\n\n\n"
-        f"💬  **Message:**\n"
+        f"💬  **Message:**\n"          # body goes here
         f"\n\n\n"
         f"📎  **Attachments:** {attachments}\n\n"
         "─────────────────────────"
     )
 
-    # Truncate message body to fit the remaining space
-    message = truncate_for_discord(message, len(frame_without_body))
+    available = DISCORD_LIMIT - len(frame_shell) - len(TRUNCATION_NOTE)
+    if len(message) > available:
+        message = message[:available] + TRUNCATION_NOTE
 
     return (
         f"{header}\n\n\n"
@@ -155,7 +169,7 @@ def main():
             "One or more required env vars are missing: LMS_USER, LMS_PASS, WEBHOOK_URL"
         )
 
-    mode = "MANUAL (all announcements)" if MANUAL_RUN else "SCHEDULED (new only)"
+    mode = "MANUAL (past 7 days + next 30 days)" if MANUAL_RUN else "SCHEDULED (new events only)"
     print(f"[MODE] {mode}")
 
     login()
@@ -167,8 +181,8 @@ def main():
 
     if MANUAL_RUN:
         send_discord(
-            "📋  **MANUAL FETCH — ALL CSE II SEM ANNOUNCEMENTS**\n\n\n"
-            "Below are all current CSE II SEM announcements from your LMS.\n"
+            "📋  **MANUAL FETCH — CSE II SEM ANNOUNCEMENTS (LAST 7 DAYS)**\n\n\n"
+            "Below are all CSE II SEM announcements from the past week.\n"
             "─────────────────────────"
         )
 
