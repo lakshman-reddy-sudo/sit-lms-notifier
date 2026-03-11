@@ -13,7 +13,7 @@ If you're a student at **Symbiosis Institute of Technology, Hyderabad**, you kno
 - You check each subject one by one — 10 subjects, 10 clicks, every single day
 
 This project fixes all of that. It's a **GitHub Actions bot** that:
-- Logs into your LMS every hour automatically
+- Logs into your LMS every 2 hours automatically
 - Scrapes new announcements from all 10 subjects
 - Pulls your consolidated attendance report
 - Sends everything to a **Discord server** with rich, formatted messages
@@ -167,7 +167,7 @@ Watch the logs in real time. You should see announcements and attendance flowing
 
 ### Step 8 — You're done! 🎉
 
-The workflow runs **automatically every hour**. You don't need to do anything else. Sit back and let it work.
+The workflow runs **automatically every 2 hours**. You don't need to do anything else. Sit back and let it work.
 
 > **Note:** GitHub Actions schedules are not perfectly on the hour — they can be delayed by 5–45 minutes depending on GitHub's server load. This is normal and expected on the free tier.
 
@@ -176,7 +176,7 @@ The workflow runs **automatically every hour**. You don't need to do anything el
 ## ⚙️ How it works (technical overview)
 
 ```
-GitHub Actions (cron: every hour)
+GitHub Actions (cron: every 2 hours)
         │
         ▼
 lms_scraper.py
@@ -196,7 +196,7 @@ lms_scraper.py
               └─ send_attendance_to_discord() → POST to webhook
 ```
 
-**Auto mode** (hourly cron): only sends announcements posted in the last hour. Sends an "all clear" message per subject if nothing is new. Always sends attendance.
+**Auto mode** (2 hourly cron): only sends announcements posted in the last 2 hours. Sends an "all clear" message per subject if nothing is new. Always sends attendance.
 
 **Manual mode** (workflow_dispatch): fetches announcements from the past N days (default 7). Attendance is optional via the `fetch_attendance` input.
 
