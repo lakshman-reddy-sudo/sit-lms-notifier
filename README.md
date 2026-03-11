@@ -204,7 +204,7 @@ lms_scraper.py
 
 ## 🔧 Adapting for other SIU batches / colleges
 
-The script is built specifically for SIT-H CSE Semester II. To adapt it:
+The script is built specifically for SIT-H. To adapt it:
 
 **Different subjects:** Update the `SUBJECTS` list in `lms_scraper.py` — change the `name`, `code`, `forum_id`, and `webhook` for each subject. Add or remove entries as needed.
 
@@ -255,7 +255,7 @@ Installed automatically by the GitHub Actions workflow. No local installation ne
 
 ## 🙌 Credits
 
-Built by **Narala Lakshman Reddy** (CSE II SEM, SIT-H) out of frustration with missing announcements.
+Built by **Narala Lakshman Reddy** (CSE, SIT-H) out of frustration with missing announcements.
 
 If this helped you never miss a test or drop below 75% attendance — share it with your classmates. The more of us who use it, the happier we all are. 😄
 
