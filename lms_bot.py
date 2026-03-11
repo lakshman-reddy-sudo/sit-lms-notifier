@@ -14,8 +14,19 @@ MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
 
 CACHE_FILE = "cache.json"
 
-# Only notify for courses whose name contains this string (case-insensitive)
-SEM_FILTER = "(CSE_II SEM)"
+# Exact course names from your LMS — only announcements from these will be sent
+TARGET_COURSES = {
+    "Career Essentials - I (CSE_II SEM)",
+    "Computer Architecture and Organization (CSE_II SEM)",
+    "Creative Thinking (CSE_II SEM)",
+    "Exploratory Data Analysis (CSE_II SEM)",
+    "Introduction to Environment and Sustainability (CSE_II SEM)",
+    "Linear Algebra (CSE_II SEM)",
+    "Microcontrollers and Sensors (CSE_II SEM)",
+    "Python Programming (CSE_II SEM)",
+    "Software Engineering (CSE_II SEM)",
+    "Technical and Professional Communication Skills (CSE_II SEM)",
+}
 
 session = requests.Session()
 
@@ -61,107 +72,35 @@ def login():
     print("[OK] Logged in.")
 
 
-def _extract_userid(text):
-    """Try multiple patterns Moodle uses across different versions/themes."""
-    patterns = [
-        r'"userid"\s*:\s*(\d+)',         # JSON: "userid":123
-        r'"id"\s*:\s*(\d+)',             # JSON: "id":123
-        r'data-userid=["\'](\d+)["\']', # HTML attr: data-userid="123"
-        r'"user":\{"id":(\d+)',          # Nested: "user":{"id":123
-        r'userid=(\d+)',                 # URL param: userid=123
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if match:
-            return match.group(1), pattern
-    return None, None
-
-
-def get_sesskey_and_userid():
+def get_sesskey():
     page = session.get(f"{LMS_URL}/my/")
-    text = page.text
-
-    if '"sesskey":"' not in text:
+    if '"sesskey":"' not in page.text:
         raise RuntimeError("Could not get sesskey — login may have failed silently.")
-    sesskey = text.split('"sesskey":"')[1].split('"')[0]
-
-    # Try extracting userid from the dashboard page
-    userid, matched_pattern = _extract_userid(text)
-
-    if userid:
-        print(f"[OK] Got sesskey and userid ({userid}) via pattern: {matched_pattern!r}")
-    else:
-        # Fallback: try the profile page
-        print("[INFO] userid not found on /my/ — trying profile page...")
-        profile_page = session.get(f"{LMS_URL}/user/profile.php")
-        userid, matched_pattern = _extract_userid(profile_page.text)
-
-        if userid:
-            print(f"[OK] Got userid ({userid}) from profile page.")
-        else:
-            # Last resort: try the preferences page
-            print("[INFO] userid not found on profile — trying preferences page...")
-            prefs_page = session.get(f"{LMS_URL}/user/preferences.php")
-            userid, matched_pattern = _extract_userid(prefs_page.text)
-
-            if userid:
-                print(f"[OK] Got userid ({userid}) from preferences page.")
-            else:
-                snippet = text[text.find("sesskey"):text.find("sesskey") + 400] if "sesskey" in text else text[:400]
-                print(f"[DEBUG] Page snippet near sesskey:\n{snippet}")
-                raise RuntimeError(
-                    "Could not extract userid from any page. "
-                    "See [DEBUG] snippet above — paste it here so we can find the right pattern."
-                )
-
-    return sesskey, userid
+    sesskey = page.text.split('"sesskey":"')[1].split('"')[0]
+    print(f"[OK] Got sesskey.")
+    return sesskey
 
 
-# ─── Moodle Web Service helper ────────────────────────────────────────────────
+# ─── Timeline ─────────────────────────────────────────────────────────────────
 
-def ws_call(sesskey, methodname, args):
-    """Call a single Moodle web service method via the AJAX endpoint."""
+def fetch_timeline(sesskey):
     url = f"{LMS_URL}/lib/ajax/service.php?sesskey={sesskey}"
-    payload = [{"index": 0, "methodname": methodname, "args": args}]
+    payload = [{
+        "index": 0,
+        "methodname": "core_calendar_get_action_events_by_timesort",
+        "args": {
+            "limitnum": 50        # Fetch up to 50 events so nothing is missed
+        }
+    }]
     r = session.post(url, json=payload)
     r.raise_for_status()
-    result = r.json()
-    if result and "data" in result[0]:
-        return result[0]["data"]
-    if result and "error" in result[0]:
-        print(f"[WARN] WS error for {methodname}: {result[0]['error']}")
-    return None
-
-
-# ─── Moodle data fetchers ─────────────────────────────────────────────────────
-
-def get_enrolled_courses(sesskey, userid):
-    data = ws_call(sesskey, "core_enrol_get_users_courses", {"userid": int(userid)})
-    return data or []
-
-
-def get_forums_for_courses(sesskey, course_ids):
-    data = ws_call(sesskey, "mod_forum_get_forums_by_courses", {"courseids": course_ids})
-    return data or []
-
-
-def get_discussions(sesskey, forum_id):
-    data = ws_call(sesskey, "mod_forum_get_forum_discussions", {
-        "forumid": forum_id,
-        "sortby": "timemodified",
-        "sortdirection": "DESC",
-        "page": 0,
-        "perpage": 10,
-    })
-    if not data:
-        return []
-    return data.get("discussions", [])
+    return r.json()
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def is_target_course(course_name):
-    return SEM_FILTER.lower() in course_name.lower()
+    return course_name in TARGET_COURSES
 
 
 def clean_html(html):
@@ -170,7 +109,7 @@ def clean_html(html):
     return clean.strip()
 
 
-def format_discord_msg(course, title, message, author, tag=""):
+def format_discord_msg(course, title, message, attachments, tag=""):
     header = f"📢  **LMS ANNOUNCEMENT — CSE II SEM**  {tag}".strip()
     return (
         f"{header}"
@@ -179,9 +118,9 @@ def format_discord_msg(course, title, message, author, tag=""):
         "\n\n\n"
         f"📌  **Title:**\n{title}"
         "\n\n\n"
-        f"✍️  **Posted by:** {author}"
-        "\n\n\n"
         f"💬  **Message:**\n{message}"
+        "\n\n\n"
+        f"📎  **Attachments:** {attachments}"
         "\n\n"
         "─────────────────────────"
     )
@@ -199,28 +138,9 @@ def main():
     print(f"[MODE] {mode}")
 
     login()
-    sesskey, userid = get_sesskey_and_userid()
-    cache = load_cache()
-
-    # Step 1: get enrolled courses, filter to CSE_II SEM only
-    all_courses    = get_enrolled_courses(sesskey, userid)
-    target_courses = [c for c in all_courses if is_target_course(c.get("fullname", ""))]
-
-    print(f"[INFO] Found {len(target_courses)} CSE_II SEM course(s) out of {len(all_courses)} total.")
-    for c in target_courses:
-        print(f"       • {c['fullname']}")
-
-    if not target_courses:
-        print("[WARN] No CSE_II SEM courses found — check SEM_FILTER value.")
-        return
-
-    # Step 2: get announcement forums for those courses
-    course_ids     = [c["id"] for c in target_courses]
-    course_map     = {c["id"]: c["fullname"] for c in target_courses}
-    all_forums     = get_forums_for_courses(sesskey, course_ids)
-    announce_forums = [f for f in all_forums if f.get("type") == "news"]
-
-    print(f"[INFO] Found {len(announce_forums)} announcement forum(s).")
+    sesskey = get_sesskey()
+    cache   = load_cache()
+    events  = fetch_timeline(sesskey)
 
     sent = 0
 
@@ -231,33 +151,42 @@ def main():
             "─────────────────────────"
         )
 
-    # Step 3: fetch discussions from each announcement forum
-    for forum in announce_forums:
-        forum_id    = forum["id"]
-        course_id   = forum.get("course")
-        course_name = course_map.get(course_id, "Unknown Course")
-        discussions = get_discussions(sesskey, forum_id)
+    for item in events:
+        if "data" not in item:
+            print(f"[WARN] Skipping item with no 'data' key.")
+            continue
 
-        for d in discussions:
-            title   = d.get("name", "")
-            message = clean_html(d.get("message", ""))
-            author  = d.get("userfullname", "Unknown")
-            key     = f"{course_id}_{d.get('id')}"
+        event_list = item["data"].get("events", [])
 
-            # Scheduled: skip already-seen posts
+        for e in event_list:
+            name        = e.get("name", "")
+            description = e.get("description", "")
+            course      = e.get("course", {}).get("fullname", "")
+            key         = name + course
+
+            # Skip courses not in our whitelist
+            if not is_target_course(course):
+                print(f"[SKIP] {course}")
+                continue
+
+            # Scheduled mode: skip already-notified events
             if not MANUAL_RUN and key in cache:
                 continue
 
+            message     = clean_html(description)
+            attachments = "✅  Present" if "pluginfile.php" in description else "❌  None"
             tag         = "*(manual)*" if MANUAL_RUN else ""
-            discord_msg = format_discord_msg(course_name, title, message, author, tag)
 
+            discord_msg = format_discord_msg(course, name, message, attachments, tag)
             send_discord(discord_msg)
             sent += 1
-            print(f"[SENT] {course_name} — {title}")
+            print(f"[SENT] {course} — {name}")
 
+            # Only update cache on scheduled runs
             if not MANUAL_RUN:
                 cache.append(key)
 
+    # Save cache only on scheduled runs
     if not MANUAL_RUN:
         save_cache(cache)
 
