@@ -344,23 +344,28 @@ def fetch_post_full(session: requests.Session, post_url: str) -> tuple[str, str,
 
         # Strip Moodle UI noise that bleeds into body text
         # Common prefixes/suffixes added by get_text fallback
-        noise_prefixes = [
-            "Settings Star this discussion",
-            "Star this discussion",
-            "Permalink",
-        ]
-        noise_suffixes = ["Permalink", "Reply", "Edit", "Delete", "Export to portfolio"]
+        import re as _re
 
-        for prefix in noise_prefixes:
-            if body.startswith(prefix):
-                body = body[len(prefix):].lstrip(" -–—")
+        # Strip Moodle UI chrome that bleeds in via get_text fallback.
+        # Pattern: "<Post Title> Settings Star this discussion <actual body> Permalink"
+        # We want just "<actual body>"
 
-        for suffix in noise_suffixes:
+        # 1. Cut everything up to and including "Settings Star this discussion"
+        marker = "Settings Star this discussion"
+        idx = body.find(marker)
+        if idx != -1:
+            body = body[idx + len(marker):].lstrip(" \n")
+
+        # 2. Also handle just "Star this discussion" without "Settings" prefix
+        marker2 = "Star this discussion"
+        if body.startswith(marker2):
+            body = body[len(marker2):].lstrip(" \n")
+
+        # 3. Strip trailing Moodle action links
+        for suffix in ["Permalink", " Reply", " Edit", " Delete", "Export to portfolio"]:
             if body.endswith(suffix):
-                body = body[:-len(suffix)].rstrip(" -–—")
+                body = body[:-len(suffix)].rstrip(" \n")
 
-        # Also strip the post title if it got duplicated at the start
-        # (Moodle sometimes repeats subject/title as first line of body)
         body = body.strip()
 
         return author, date_str, body
