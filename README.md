@@ -248,7 +248,6 @@ Installed automatically by the GitHub Actions workflow. No local installation ne
 ## 🔒 Security
 
 - Your LMS credentials are stored as **GitHub Encrypted Secrets** — they are never visible in logs, to collaborators, or to GitHub itself
-- The repository should be set to **Private**
 - The script never stores or transmits your credentials anywhere other than directly to your institution's LMS login endpoint
 
 ---
