@@ -217,67 +217,164 @@ def parse_moodle_date(raw: str) -> datetime | None:
 # ─────────────────────────────────────────────────────────────────
 # 3. ANNOUNCEMENT SCRAPER
 # ─────────────────────────────────────────────────────────────────
+def _extract_row_data(row) -> dict:
+    """Pull title/url/date/author/replies from a single table row or div."""
+    # Title + link
+    title_tag = (
+        row.select_one("td.topic a")
+        or row.select_one("td.subject a")
+        or row.select_one("a.w-100")
+        or row.select_one("a[href*='discuss.php']")
+        or row.select_one("a[href*='forum/discuss']")
+    )
+    if not title_tag:
+        return {}
+
+    title    = title_tag.get_text(strip=True)
+    post_url = title_tag.get("href", "")
+    if not post_url.startswith("http"):
+        post_url = LMS_BASE + post_url
+
+    # Date — crawl every <td> for a parseable date
+    date_obj = None
+    date_str = "Unknown date"
+    for sel in ["td.lastpost", "td.created", "td.modified"]:
+        td = row.select_one(sel)
+        if td:
+            date_obj = parse_moodle_date(td.get_text(" ", strip=True))
+            if date_obj:
+                date_str = date_obj.strftime("%d %b %Y, %I:%M %p")
+                break
+    if not date_obj:
+        # Brute-force: check every td's text for a date pattern
+        for td in row.find_all("td"):
+            txt = td.get_text(" ", strip=True)
+            d   = parse_moodle_date(txt)
+            if d:
+                date_obj = d
+                date_str = d.strftime("%d %b %Y, %I:%M %p")
+                break
+
+    # Author
+    author_tag = (
+        row.select_one("td.author a")
+        or row.select_one(".author a")
+        or row.select_one("td.userpicture + td a")
+    )
+    author  = author_tag.get_text(strip=True) if author_tag else "Unknown"
+
+    # Replies
+    rep_td  = row.select_one("td.replies")
+    replies = rep_td.get_text(strip=True) if rep_td else "—"
+
+    return {
+        "title":    title,
+        "url":      post_url,
+        "date":     date_obj,
+        "date_str": date_str,
+        "author":   author,
+        "replies":  replies,
+    }
+
+
 def fetch_announcements(session: requests.Session, forum_id: str, lookback_hours: int) -> list:
     url    = f"{LMS_BASE}/mod/forum/view.php?id={forum_id}"
     cutoff = datetime.now() - timedelta(hours=lookback_hours)
     r      = session.get(url, timeout=20)
     soup   = BeautifulSoup(r.text, "html.parser")
 
-    # Try all known Moodle forum table layouts
+    print(f"    📄 Page title: {soup.title.string.strip() if soup.title else 'N/A'}")
+
+    # ── Strategy A: known Moodle row selectors ────────────────────
     rows = (
         soup.select("tr.discussion")
         or soup.select("table.forumheaderlist tr")[1:]
         or soup.select(".discussion-list .discussion")
         or []
     )
+    print(f"    🔎 Strategy A rows found: {len(rows)}")
 
-    results = []
-    for row in rows:
-        try:
-            title_tag = (
-                row.select_one("td.topic a")
-                or row.select_one("a.w-100")
-                or row.select_one("td.subject a")
-            )
-            if not title_tag:
-                continue
-
-            title    = title_tag.get_text(strip=True)
-            post_url = title_tag.get("href", "")
+    # ── Strategy B: nuclear — find ALL discuss.php links ─────────
+    # Works regardless of table/div layout used by this Moodle theme
+    if not rows:
+        all_links = soup.find_all("a", href=re.compile(r"forum/discuss\.php|mod/forum/discuss"))
+        print(f"    🔎 Strategy B links found: {len(all_links)}")
+        results = []
+        seen    = set()
+        for a in all_links:
+            post_url = a.get("href", "")
             if not post_url.startswith("http"):
                 post_url = LMS_BASE + post_url
+            if post_url in seen:
+                continue
+            seen.add(post_url)
 
-            # Date — try multiple columns
+            title = a.get_text(strip=True)
+            if not title:
+                continue
+
+            # Walk up the DOM to find date text near this link
             date_obj = None
-            for sel in ["td.lastpost", "td.created", "td.modified"]:
-                td = row.select_one(sel)
-                if td:
-                    date_obj = parse_moodle_date(td.get_text(" ", strip=True))
-                    if date_obj:
-                        break
+            date_str = "Unknown date"
+            parent   = a.parent
+            for _ in range(5):           # up to 5 levels up
+                if parent is None:
+                    break
+                txt = parent.get_text(" ", strip=True)
+                d   = parse_moodle_date(txt)
+                if d:
+                    date_obj = d
+                    date_str = d.strftime("%d %b %Y, %I:%M %p")
+                    break
+                parent = parent.parent
 
-            # Author
-            author_tag = row.select_one("td.author a") or row.select_one(".author a")
-            author     = author_tag.get_text(strip=True) if author_tag else "Unknown"
+            # Author — sibling/nearby text
+            author = "Unknown"
+            if a.parent:
+                sib_text = a.parent.get_text(" ", strip=True)
+                # Remove the title itself to isolate metadata
+                meta = sib_text.replace(title, "").strip()
+                if meta:
+                    author = meta[:40]
 
-            # Replies
-            rep_td  = row.select_one("td.replies")
-            replies = rep_td.get_text(strip=True) if rep_td else "—"
-
-            if date_obj and date_obj >= cutoff:
+            # In MANUAL mode: include even if date unknown (forum only shows recent posts)
+            # In AUTO mode:   require date within 1 hr
+            if RUN_MODE == "manual" or (date_obj and date_obj >= cutoff):
                 results.append({
                     "title":    title,
                     "url":      post_url,
-                    "date":     date_obj,
-                    "date_str": date_obj.strftime("%d %b %Y, %I:%M %p"),
+                    "date":     date_obj or datetime.min,
+                    "date_str": date_str,
                     "author":   author,
-                    "replies":  replies,
+                    "replies":  "—",
                 })
+
+        results.sort(key=lambda x: x["date"], reverse=True)
+        return results
+
+    # ── Process Strategy A rows ───────────────────────────────────
+    results = []
+    for row in rows:
+        try:
+            data = _extract_row_data(row)
+            if not data:
+                continue
+
+            date_obj = data["date"]
+            # Manual: include posts even if date unreadable (forum is already scoped to recent)
+            # Auto:   must fall within cutoff
+            if RUN_MODE == "manual":
+                include = True
+            else:
+                include = date_obj is not None and date_obj >= cutoff
+
+            if include:
+                results.append(data)
 
         except Exception as ex:
             print(f"    ⚠️  Skipped row: {ex}")
 
-    results.sort(key=lambda x: x["date"], reverse=True)
+    results.sort(key=lambda x: (x["date"] or datetime.min), reverse=True)
     return results
 
 
@@ -322,9 +419,9 @@ def fetch_attendance(session: requests.Session) -> list | None:
         r    = session.get(ATTENDANCE_URL, timeout=25)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Redirect-to-login check
-        if "loginerrormessage" in r.text or r.url != ATTENDANCE_URL:
-            print("  ⚠️  Attendance page session issue.")
+        # Redirect-to-login check (don't use r.url comparison — redirects may vary)
+        if soup.find(id="loginerrormessage") or soup.find(class_="loginerrormessage"):
+            print("  ⚠️  Attendance page redirected to login.")
             return None
 
         records = []
@@ -332,38 +429,81 @@ def fetch_attendance(session: requests.Session) -> list | None:
         # ── Strategy A: HTML <table> ─────────────────────────────────
         table = soup.find("table")
         if table:
-            raw_headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+            raw_headers = [th.get_text(strip=True) for th in table.find_all("th")]
+            print(f"  📋 Attendance table headers: {raw_headers}")
+            headers_lower = [h.lower() for h in raw_headers]
 
             def col_idx(*keys):
                 for k in keys:
-                    for i, h in enumerate(raw_headers):
+                    for i, h in enumerate(headers_lower):
                         if k in h:
                             return i
                 return -1
 
-            idx_subj    = col_idx("subject", "course", "name")
-            idx_present = col_idx("present", "attended")
-            idx_absent  = col_idx("absent")
-            idx_total   = col_idx("total", "conducted", "classes")
-            idx_pct     = col_idx("percent", "%", "attendance")
+            idx_subj    = col_idx("subject", "course", "name", "paper", "module")
+            idx_present = col_idx("present", "attended", "held")
+            idx_absent  = col_idx("absent", "missed")
+            idx_total   = col_idx("total", "conducted", "classes", "held")
+            idx_pct     = col_idx("percent", "%", "attendance", "ratio")
 
+            print(f"  📋 Col indices → subj:{idx_subj} present:{idx_present} absent:{idx_absent} total:{idx_total} pct:{idx_pct}")
+
+            # Collect all data rows first to detect subject column by content
+            all_rows_cells = []
             for tr in table.find_all("tr")[1:]:
                 cells = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if not cells or len(cells) < 2:
-                    continue
+                if cells and len(cells) >= 2:
+                    all_rows_cells.append(cells)
 
+            # If subject column not found by header, find it by content:
+            # The subject column has the most alphabetic/non-numeric text
+            if idx_subj < 0 and all_rows_cells:
+                num_cols = max(len(r) for r in all_rows_cells)
+                alpha_scores = []
+                for ci in range(num_cols):
+                    col_vals = [r[ci] for r in all_rows_cells if ci < len(r)]
+                    # Score = average ratio of alpha chars; skip % columns
+                    score = sum(
+                        sum(1 for c in v if c.isalpha()) / max(len(v), 1)
+                        for v in col_vals
+                    ) / max(len(col_vals), 1)
+                    alpha_scores.append(score)
+                idx_subj = alpha_scores.index(max(alpha_scores))
+                print(f"  📋 Subject col auto-detected at index {idx_subj} (alpha scores: {[f'{s:.2f}' for s in alpha_scores]})")
+
+            # If pct column not found by header, find it by content:
+            # The pct column's cells all match \d+(\.\d+)?%
+            if idx_pct < 0 and all_rows_cells:
+                num_cols = max(len(r) for r in all_rows_cells)
+                for ci in range(num_cols):
+                    col_vals = [r[ci] for r in all_rows_cells if ci < len(r)]
+                    pct_hits = sum(1 for v in col_vals if re.match(r"^\d+(\.\d+)?%?$", v) and float(re.sub(r"[^\d.]","",v) or 0) <= 100)
+                    if pct_hits >= len(col_vals) * 0.7:   # 70% of rows look like percentages
+                        idx_pct = ci
+                        print(f"  📋 Pct col auto-detected at index {idx_pct}")
+                        break
+
+            for cells in all_rows_cells:
                 def cell(idx):
                     return cells[idx] if 0 <= idx < len(cells) else "—"
 
-                subj    = cell(idx_subj)    if idx_subj    >= 0 else cells[0]
+                subj    = cell(idx_subj)    if idx_subj    >= 0 else "—"
                 present = cell(idx_present) if idx_present >= 0 else "—"
                 absent  = cell(idx_absent)  if idx_absent  >= 0 else "—"
                 total   = cell(idx_total)   if idx_total   >= 0 else "—"
                 pct_raw = cell(idx_pct)     if idx_pct     >= 0 else "—"
 
+                # If pct_raw doesn't look like a number, search all cells for one
                 pct = _pct_float(pct_raw)
+                if pct is None:
+                    for v in cells:
+                        candidate = _pct_float(v)
+                        if candidate is not None and 0 <= candidate <= 100:
+                            pct = candidate
+                            pct_raw = v
+                            break
 
-                if subj and subj != "—":
+                if subj and subj not in ("—", "") and not subj.isdigit():
                     records.append({
                         "subject":    subj,
                         "present":    present,
@@ -376,6 +516,7 @@ def fetch_attendance(session: requests.Session) -> list | None:
 
         # ── Strategy B: card/div layout ──────────────────────────────
         if not records:
+            print("  📋 No table records — trying div/card layout.")
             for card in soup.select(".attendance-card, .subject-row, [class*='attend']"):
                 text  = card.get_text(" ", strip=True)
                 m_pct = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
@@ -395,10 +536,54 @@ def fetch_attendance(session: requests.Session) -> list | None:
                     "status":     _status(pct),
                 })
 
+        # ── Strategy C: brute-force percentage hunt ───────────────────
+        # If we got records but subjects are all digits, page has a weird layout
+        # Try to find subject names from nearby text around % values
+        if not records or all(r["subject"].isdigit() for r in records):
+            print("  📋 Falling back to Strategy C — brute-force % search.")
+            records = []
+            seen_pcts = set()
+            for tag in soup.find_all(string=re.compile(r"\d+\.?\d*\s*%")):
+                m = re.search(r"(\d+\.?\d*)\s*%", tag)
+                if not m:
+                    continue
+                pct = float(m.group(1))
+                if pct > 100 or round(pct, 2) in seen_pcts:
+                    continue
+                seen_pcts.add(round(pct, 2))
+
+                # Walk up DOM looking for subject name
+                subj = "Unknown"
+                node = tag.parent
+                for _ in range(6):
+                    if node is None:
+                        break
+                    # Look for a sibling or child that has alpha text
+                    candidate = node.get_text(" ", strip=True)
+                    # Strip the pct itself
+                    candidate = re.sub(r"\d+\.?\d*\s*%", "", candidate).strip()
+                    if len(candidate) > 5 and any(c.isalpha() for c in candidate):
+                        subj = candidate[:60]
+                        break
+                    node = node.parent
+
+                records.append({
+                    "subject":    subj,
+                    "present":    "—",
+                    "absent":     "—",
+                    "total":      "—",
+                    "percentage": f"{pct:.1f}%",
+                    "pct_float":  pct,
+                    "status":     _status(pct),
+                })
+
+        print(f"  📋 Final record count: {len(records)}")
         return records or None
 
     except Exception as ex:
+        import traceback
         print(f"  ❌ Attendance scrape error: {ex}")
+        traceback.print_exc()
         return None
 
 
