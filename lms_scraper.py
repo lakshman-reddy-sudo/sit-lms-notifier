@@ -1,20 +1,14 @@
 """
-LMS Announcement + Attendance Notifier — SIU Hyderabad
-=======================================================
-Modes:
-  - MANUAL  (workflow_dispatch): fetches past 7 days of announcements for all subjects
-  - AUTO    (schedule, every hr): fetches only new posts in last 1 hour + scrapes attendance
-
-Fixes (v2):
-  - Full announcement body (no 320-char truncation); long posts split across multiple Discord msgs
-  - Discord 2000-char embed description limit respected with smart chunking
-  - Attendance: tries multiple known URL patterns + dumps debug HTML on failure for diagnosis
-  - Re-login retry for attendance if first attempt returns login page
+LMS Announcement + Attendance Notifier — SIU Hyderabad  v3
+===========================================================
+AUTO  (hourly cron) : new announcements in last 1 hr per subject
+                      + sends "all clear" if nothing new
+                      + attendance report every hour
+MANUAL (dispatch)   : past N days announcements, optional attendance
 """
 
 import os
 import re
-import json
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -25,13 +19,16 @@ from datetime import datetime, timedelta
 LMS_BASE      = "https://lmssithyd.siu.edu.in"
 LMS_LOGIN_URL = f"{LMS_BASE}/login/index.php"
 
-# Try multiple known attendance URL patterns
+# All known / likely attendance page paths — tried in order
 ATTENDANCE_URLS = [
     f"{LMS_BASE}/attendance-report/Student-Attendance/index.php",
+    f"{LMS_BASE}/attendance-report/index.php",
     f"{LMS_BASE}/local/attendance/index.php",
+    f"{LMS_BASE}/local/attendancereport/index.php",
     f"{LMS_BASE}/report/attendance/index.php",
     f"{LMS_BASE}/blocks/attendance/index.php",
     f"{LMS_BASE}/mod/attendance/view.php",
+    f"{LMS_BASE}/my/",   # dashboard — will hunt for attendance links here
 ]
 
 LMS_USERNAME = os.environ["LMS_USERNAME"]
@@ -40,74 +37,24 @@ LMS_PASSWORD = os.environ["LMS_PASSWORD"]
 RUN_MODE       = os.environ.get("RUN_MODE", "manual").lower()
 LOOKBACK_HOURS = 1 if RUN_MODE == "auto" else int(os.environ.get("LOOKBACK_DAYS", 7)) * 24
 
+# Discord limits
+EMBED_DESC_LIMIT   = 4000   # Discord allows up to 4096; stay safe at 4000
+EMBEDS_PER_PAYLOAD = 10     # max embeds per single webhook POST
+
 SUBJECTS = [
-    {
-        "name": "Career Essentials",             "code": "CE",
-        "forum_id": "1942",
-        "webhook": os.environ["WEBHOOK_CAREER_ESSENTIALS"],
-        "emoji": "💼", "color": 0x5865F2,
-    },
-    {
-        "name": "Computer Architecture and Organization", "code": "CAO",
-        "forum_id": "1937",
-        "webhook": os.environ["WEBHOOK_COMPUTER_ARCH"],
-        "emoji": "🖥️", "color": 0xEB459E,
-    },
-    {
-        "name": "Creative Thinking",             "code": "CT",
-        "forum_id": "1941",
-        "webhook": os.environ["WEBHOOK_CREATIVE_THINKING"],
-        "emoji": "🎨", "color": 0xFEE75C,
-    },
-    {
-        "name": "Exploratory Data Analysis",     "code": "EDA",
-        "forum_id": "1935",
-        "webhook": os.environ["WEBHOOK_EDA"],
-        "emoji": "📊", "color": 0x57F287,
-    },
-    {
-        "name": "Introduction to Environment and Sustainability", "code": "IES",
-        "forum_id": "1936",
-        "webhook": os.environ["WEBHOOK_ENV_SUSTAIN"],
-        "emoji": "🌿", "color": 0x2ECC71,
-    },
-    {
-        "name": "Linear Algebra",                "code": "LA",
-        "forum_id": "1933",
-        "webhook": os.environ["WEBHOOK_LINEAR_ALGEBRA"],
-        "emoji": "📐", "color": 0x9B59B6,
-    },
-    {
-        "name": "Microcontrollers and Sensors",  "code": "MCS",
-        "forum_id": "1934",
-        "webhook": os.environ["WEBHOOK_MICROCONTROLLERS"],
-        "emoji": "🔌", "color": 0xE67E22,
-    },
-    {
-        "name": "Python Programming",            "code": "PY",
-        "forum_id": "1939",
-        "webhook": os.environ["WEBHOOK_PYTHON"],
-        "emoji": "🐍", "color": 0x3498DB,
-    },
-    {
-        "name": "Software Engineering",          "code": "SE",
-        "forum_id": "1938",
-        "webhook": os.environ["WEBHOOK_SOFTWARE_ENG"],
-        "emoji": "⚙️", "color": 0xE74C3C,
-    },
-    {
-        "name": "Technical and Professional Communication Skills", "code": "TPCS",
-        "forum_id": "1940",
-        "webhook": os.environ["WEBHOOK_TPCS"],
-        "emoji": "📝", "color": 0x1ABC9C,
-    },
+    {"name": "Career Essentials",                               "code": "CE",   "forum_id": "1942", "webhook": os.environ["WEBHOOK_CAREER_ESSENTIALS"],  "emoji": "💼", "color": 0x5865F2},
+    {"name": "Computer Architecture and Organization",          "code": "CAO",  "forum_id": "1937", "webhook": os.environ["WEBHOOK_COMPUTER_ARCH"],      "emoji": "🖥️", "color": 0xEB459E},
+    {"name": "Creative Thinking",                               "code": "CT",   "forum_id": "1941", "webhook": os.environ["WEBHOOK_CREATIVE_THINKING"],   "emoji": "🎨", "color": 0xFEE75C},
+    {"name": "Exploratory Data Analysis",                       "code": "EDA",  "forum_id": "1935", "webhook": os.environ["WEBHOOK_EDA"],                 "emoji": "📊", "color": 0x57F287},
+    {"name": "Introduction to Environment and Sustainability",  "code": "IES",  "forum_id": "1936", "webhook": os.environ["WEBHOOK_ENV_SUSTAIN"],         "emoji": "🌿", "color": 0x2ECC71},
+    {"name": "Linear Algebra",                                  "code": "LA",   "forum_id": "1933", "webhook": os.environ["WEBHOOK_LINEAR_ALGEBRA"],      "emoji": "📐", "color": 0x9B59B6},
+    {"name": "Microcontrollers and Sensors",                    "code": "MCS",  "forum_id": "1934", "webhook": os.environ["WEBHOOK_MICROCONTROLLERS"],    "emoji": "🔌", "color": 0xE67E22},
+    {"name": "Python Programming",                              "code": "PY",   "forum_id": "1939", "webhook": os.environ["WEBHOOK_PYTHON"],              "emoji": "🐍", "color": 0x3498DB},
+    {"name": "Software Engineering",                            "code": "SE",   "forum_id": "1938", "webhook": os.environ["WEBHOOK_SOFTWARE_ENG"],        "emoji": "⚙️", "color": 0xE74C3C},
+    {"name": "Technical and Professional Communication Skills", "code": "TPCS", "forum_id": "1940", "webhook": os.environ["WEBHOOK_TPCS"],                "emoji": "📝", "color": 0x1ABC9C},
 ]
 
 ATTENDANCE_WEBHOOK = os.environ.get("WEBHOOK_ATTENDANCE", "")
-
-# Discord limits
-DISCORD_EMBED_DESC_LIMIT = 4000   # Discord allows up to 4096 chars per embed description
-DISCORD_EMBEDS_PER_MSG   = 10     # max embeds per webhook POST
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -116,104 +63,80 @@ DISCORD_EMBEDS_PER_MSG   = 10     # max embeds per webhook POST
 def login_to_lms() -> requests.Session:
     session = requests.Session()
     session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        ),
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection":      "keep-alive",
     })
 
-    print(f"  🌐 Fetching login page: {LMS_LOGIN_URL}")
+    print("  🌐 Fetching login page…")
     r    = session.get(LMS_LOGIN_URL, timeout=20)
     soup = BeautifulSoup(r.text, "html.parser")
 
     token_tag  = soup.find("input", {"name": "logintoken"})
     logintoken = token_tag["value"] if token_tag else ""
-    print(f"  🔑 logintoken: {'found' if logintoken else 'NOT FOUND (will try without)'}")
+    print(f"  🔑 logintoken: {'found' if logintoken else 'NOT FOUND'}")
 
-    post_data = {
-        "username":         LMS_USERNAME,
-        "password":         LMS_PASSWORD,
-        "logintoken":       logintoken,
-        "anchor":           "",
-        "rememberusername": "1",
-    }
-    r = session.post(LMS_LOGIN_URL, data=post_data, timeout=20, allow_redirects=True)
+    r = session.post(LMS_LOGIN_URL, data={
+        "username": LMS_USERNAME, "password": LMS_PASSWORD,
+        "logintoken": logintoken, "anchor": "", "rememberusername": "1",
+    }, timeout=20, allow_redirects=True)
 
     final_url  = r.url
-    page_lower = r.text.lower()
     soup_after = BeautifulSoup(r.text, "html.parser")
 
-    print(f"  🔗 Post-login URL: {final_url}")
+    if soup_after.find(id="loginerrormessage") or soup_after.find(class_="loginerrormessage"):
+        raise RuntimeError("❌ LMS login failed — wrong credentials?")
 
-    has_error = (
-        'id="loginerrormessage"' in r.text
-        or 'class="loginerrormessage"' in r.text
-        or soup_after.find(id="loginerrormessage") is not None
-        or soup_after.find(class_="loginerrormessage") is not None
-    )
-    has_success = (
-        'data-loginurl' not in r.text
-        and (
-            "/my/" in final_url
-            or "logout" in page_lower
-            or soup_after.find("a", {"data-title": "logout,moodle"}) is not None
-            or soup_after.find(attrs={"class": lambda c: c and "usermenu" in c}) is not None
-            or soup_after.find("div", {"id": "page-my-index"}) is not None
-        )
+    logged_in = (
+        "/my/" in final_url
+        or "logout" in r.text.lower()
+        or soup_after.find("a", {"data-title": "logout,moodle"}) is not None
+        or soup_after.find(attrs={"class": lambda c: c and "usermenu" in c}) is not None
+        or soup_after.find("div", {"id": "page-my-index"}) is not None
     )
 
-    if has_error:
-        raise RuntimeError(
-            "❌ LMS login failed — Moodle returned an error message.\n"
-            "   Double-check LMS_USERNAME and LMS_PASSWORD secrets."
-        )
-    if not has_success:
-        snippet = r.text[:800].replace("\n", " ")
-        print(f"  ⚠️  Login result unclear. Page snippet:\n  {snippet}\n")
-        print("  ⚠️  Proceeding anyway — will fail gracefully if session is bad.")
+    if logged_in:
+        print("  ✅ Logged in successfully.")
     else:
-        print("✅ Logged in to LMS successfully.")
+        print(f"  ⚠️  Login unclear (URL={final_url}). Proceeding anyway.")
 
     return session
+
+
+def _is_login_page(soup: BeautifulSoup, url: str) -> bool:
+    return (
+        "login/index.php" in url
+        or soup.find("input", {"name": "logintoken"}) is not None
+        or soup.find(id="loginerrormessage") is not None
+    )
 
 
 # ─────────────────────────────────────────────────────────────────
 # 2. DATE PARSER
 # ─────────────────────────────────────────────────────────────────
 MOODLE_FORMATS = [
-    "%d %B %Y, %I:%M %p",
-    "%d %b %Y, %I:%M %p",
-    "%A, %d %B %Y, %I:%M %p",
-    "%d/%m/%Y, %I:%M %p",
-    "%d %B %Y",
-    "%d %b %Y",
+    "%d %B %Y, %I:%M %p", "%d %b %Y, %I:%M %p",
+    "%A, %d %B %Y, %I:%M %p", "%d/%m/%Y, %I:%M %p",
+    "%d %B %Y", "%d %b %Y",
 ]
 
 def parse_moodle_date(raw: str) -> datetime | None:
-    if not raw:
-        return None
+    if not raw: return None
     raw = raw.strip()
     now = datetime.now()
-    if raw.lower().startswith("today"):
-        return now
-    if raw.lower().startswith("yesterday"):
-        return now - timedelta(days=1)
+    if raw.lower().startswith("today"):     return now
+    if raw.lower().startswith("yesterday"): return now - timedelta(days=1)
     for fmt in MOODLE_FORMATS:
         try:
-            return datetime.strptime(raw[: len(fmt) + 6].strip(), fmt)
+            return datetime.strptime(raw[:len(fmt) + 6].strip(), fmt)
         except ValueError:
             continue
     m = re.search(r"(\d{1,2})\s+(\w+)\s+(\d{4})", raw)
     if m:
-        try:
-            return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y")
-        except Exception:
-            pass
+        try: return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%d %B %Y")
+        except Exception: pass
     return None
 
 
@@ -222,22 +145,17 @@ def parse_moodle_date(raw: str) -> datetime | None:
 # ─────────────────────────────────────────────────────────────────
 def _extract_row_data(row) -> dict:
     title_tag = (
-        row.select_one("td.topic a")
-        or row.select_one("td.subject a")
-        or row.select_one("a.w-100")
-        or row.select_one("a[href*='discuss.php']")
+        row.select_one("td.topic a") or row.select_one("td.subject a")
+        or row.select_one("a.w-100") or row.select_one("a[href*='discuss.php']")
         or row.select_one("a[href*='forum/discuss']")
     )
-    if not title_tag:
-        return {}
+    if not title_tag: return {}
 
     title    = title_tag.get_text(strip=True)
     post_url = title_tag.get("href", "")
-    if not post_url.startswith("http"):
-        post_url = LMS_BASE + post_url
+    if not post_url.startswith("http"): post_url = LMS_BASE + post_url
 
-    date_obj = None
-    date_str = "Unknown date"
+    date_obj, date_str = None, "Unknown date"
     for sel in ["td.lastpost", "td.created", "td.modified"]:
         td = row.select_one(sel)
         if td:
@@ -247,99 +165,60 @@ def _extract_row_data(row) -> dict:
                 break
     if not date_obj:
         for td in row.find_all("td"):
-            txt = td.get_text(" ", strip=True)
-            d   = parse_moodle_date(txt)
+            d = parse_moodle_date(td.get_text(" ", strip=True))
             if d:
-                date_obj = d
-                date_str = d.strftime("%d %b %Y, %I:%M %p")
+                date_obj, date_str = d, d.strftime("%d %b %Y, %I:%M %p")
                 break
 
     author_tag = (
-        row.select_one("td.author a")
-        or row.select_one(".author a")
+        row.select_one("td.author a") or row.select_one(".author a")
         or row.select_one("td.userpicture + td a")
     )
     author  = author_tag.get_text(strip=True) if author_tag else "Unknown"
     rep_td  = row.select_one("td.replies")
     replies = rep_td.get_text(strip=True) if rep_td else "—"
 
-    return {
-        "title":    title,
-        "url":      post_url,
-        "date":     date_obj,
-        "date_str": date_str,
-        "author":   author,
-        "replies":  replies,
-    }
+    return {"title": title, "url": post_url, "date": date_obj,
+            "date_str": date_str, "author": author, "replies": replies}
 
 
 def fetch_post_full(session: requests.Session, post_url: str) -> tuple[str, str, str]:
-    """
-    Fetch the discuss.php page and extract:
-      - author name
-      - posted date string
-      - FULL post body text (no truncation)
-    Returns (author, date_str, full_body)
-    """
+    """Returns (author, date_str, full_body_text) — no truncation."""
     try:
         r    = session.get(post_url, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # ── Author ────────────────────────────────────────────────
         author = "Unknown"
-        for sel in [
-            ".author a", ".username a", ".fullname",
-            "[data-region='post'] .username",
-            ".forumpost .author a",
-            "address.author a",
-        ]:
+        for sel in [".author a", ".username a", ".fullname",
+                    "[data-region='post'] .username", ".forumpost .author a", "address.author a"]:
             tag = soup.select_one(sel)
-            if tag:
-                author = tag.get_text(strip=True)
-                break
+            if tag: author = tag.get_text(strip=True); break
 
-        # ── Date ─────────────────────────────────────────────────
         date_str = "Unknown date"
-        for sel in [
-            ".author time", "time[datetime]",
-            ".forumpost .date", ".posted", ".lastpost time",
-            "[data-region='post'] .date",
-        ]:
+        for sel in [".author time", "time[datetime]", ".forumpost .date",
+                    ".posted", ".lastpost time", "[data-region='post'] .date"]:
             tag = soup.select_one(sel)
             if tag:
                 raw = tag.get("datetime", "") or tag.get_text(strip=True)
                 d   = parse_moodle_date(raw)
-                if d:
-                    date_str = d.strftime("%d %b %Y, %I:%M %p")
-                    break
-                elif raw:
-                    date_str = raw[:30]
-                    break
+                date_str = d.strftime("%d %b %Y, %I:%M %p") if d else raw[:30]
+                break
 
-        # ── Full post body (no truncation) ────────────────────────
         body = ""
-        for sel in [
-            ".posting",
-            "[data-region='post-content-container']",
-            ".post-content-container",
-            ".forumpost .content .no-overflow",
-            ".forumpost .posting",
-            "div.message",
-        ]:
+        for sel in [".posting", "[data-region='post-content-container']",
+                    ".post-content-container", ".forumpost .content .no-overflow",
+                    ".forumpost .posting", "div.message"]:
             tag = soup.select_one(sel)
             if tag:
-                for t in tag.find_all(["img", "script", "style"]):
-                    t.decompose()
-                text = tag.get_text(" ", strip=True)
-                text = re.sub(r"\s+", " ", text).strip()
+                for t in tag.find_all(["img", "script", "style"]): t.decompose()
+                text = re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip()
                 if len(text) > 20:
-                    body = text   # NO truncation — full body
+                    body = text  # full body, no truncation
                     break
 
         return author, date_str, body
-
     except Exception as ex:
-        print(f"      ⚠️  Could not fetch post body: {ex}")
+        print(f"      ⚠️  Could not fetch post: {ex}")
         return "Unknown", "Unknown date", ""
 
 
@@ -349,64 +228,46 @@ def fetch_announcements(session: requests.Session, forum_id: str, lookback_hours
     r      = session.get(url, timeout=20)
     soup   = BeautifulSoup(r.text, "html.parser")
 
-    print(f"    📄 Page title: {soup.title.string.strip() if soup.title else 'N/A'}")
+    print(f"    📄 {soup.title.string.strip() if soup.title else 'N/A'}")
 
-    # ── Strategy A: known Moodle row selectors ────────────────────
     rows = (
         soup.select("tr.discussion")
         or soup.select("table.forumheaderlist tr")[1:]
         or soup.select(".discussion-list .discussion")
         or []
     )
-    print(f"    🔎 Strategy A rows found: {len(rows)}")
+    print(f"    🔎 Strategy A rows: {len(rows)}")
 
-    # ── Strategy B: find ALL discuss.php links ────────────────────
     if not rows:
         all_links = soup.find_all("a", href=re.compile(r"forum/discuss\.php|mod/forum/discuss"))
-        print(f"    🔎 Strategy B links found: {len(all_links)}")
-        results = []
-        seen    = set()
+        print(f"    🔎 Strategy B links: {len(all_links)}")
+        results, seen = [], set()
         for a in all_links:
             post_url = a.get("href", "")
-            if not post_url.startswith("http"):
-                post_url = LMS_BASE + post_url
-            if post_url in seen:
-                continue
+            if not post_url.startswith("http"): post_url = LMS_BASE + post_url
+            if post_url in seen: continue
             seen.add(post_url)
             title = a.get_text(strip=True)
-            if not title:
-                continue
-            results.append({
-                "title":    title,
-                "url":      post_url,
-                "date":     None,
-                "date_str": "Unknown date",
-                "author":   "Unknown",
-                "replies":  "—",
-                "body":     "",
-            })
+            if not title: continue
+            results.append({"title": title, "url": post_url, "date": None,
+                             "date_str": "Unknown date", "author": "Unknown",
+                             "replies": "—", "body": ""})
 
         for post in results[:9]:
             author, date_str, body = fetch_post_full(session, post["url"])
-            post["author"]   = author
-            post["date_str"] = date_str
-            post["body"]     = body
-            d = parse_moodle_date(date_str)
-            post["date"] = d or datetime.min
+            post.update({"author": author, "date_str": date_str, "body": body,
+                         "date": parse_moodle_date(date_str) or datetime.min})
 
         if RUN_MODE == "auto":
             results = [p for p in results if p["date"] >= cutoff]
-
         results.sort(key=lambda x: x["date"], reverse=True)
         return results
 
-    # ── Process Strategy A rows ───────────────────────────────────
     results = []
     for row in rows:
         try:
             data = _extract_row_data(row)
-            if not data:
-                continue
+            if not data: continue
             date_obj = data["date"]
             include  = True if RUN_MODE == "manual" else (date_obj is not None and date_obj >= cutoff)
             if include:
@@ -428,82 +289,51 @@ def fetch_announcements(session: requests.Session, forum_id: str, lookback_hours
 # ─────────────────────────────────────────────────────────────────
 def _pct_float(raw: str) -> float | None:
     clean = re.sub(r"[^\d.]", "", raw)
-    try:
-        return float(clean) if clean else None
-    except ValueError:
-        return None
-
+    try:    return float(clean) if clean else None
+    except: return None
 
 def _status(pct: float | None) -> str:
-    if pct is None:   return "⚪ N/A"
-    if pct >= 85:     return "🟢 Safe"
-    if pct >= 75:     return "🟡 Borderline"
-    return "🔴 Low"
-
+    if pct is None: return "⚪"
+    if pct >= 85:   return "🟢"
+    if pct >= 75:   return "🟡"
+    return "🔴"
 
 def _classes_needed(present: str, total: str, target: float = 75.0) -> int | None:
     try:
-        p = int(re.sub(r"\D", "", present))
-        t = int(re.sub(r"\D", "", total))
+        p, t = int(re.sub(r"\D", "", present)), int(re.sub(r"\D", "", total))
         if t == 0: return None
         if p / t >= target / 100: return 0
-        needed = 0
-        while (p + needed) / (t + needed) < target / 100:
-            needed += 1
-        return needed
-    except Exception:
-        return None
-
+        n = 0
+        while (p + n) / (t + n) < target / 100: n += 1
+        return n
+    except: return None
 
 def _classes_can_skip(present: str, total: str, target: float = 75.0) -> int | None:
     try:
-        p = int(re.sub(r"\D", "", present))
-        t = int(re.sub(r"\D", "", total))
+        p, t = int(re.sub(r"\D", "", present)), int(re.sub(r"\D", "", total))
         if t == 0 or p / t < target / 100: return 0
-        can_skip = 0
-        while t + can_skip + 1 > 0 and p / (t + can_skip + 1) >= target / 100:
-            can_skip += 1
-        return can_skip
-    except Exception:
-        return None
-
-
-def _is_logged_in_page(soup: BeautifulSoup, url: str) -> bool:
-    """Return False if the page looks like a login redirect."""
-    if soup.find(id="loginerrormessage") or soup.find(class_="loginerrormessage"):
-        return False
-    if "login/index.php" in url:
-        return False
-    if soup.find("input", {"name": "logintoken"}):
-        return False
-    return True
+        s = 0
+        while t + s + 1 > 0 and p / (t + s + 1) >= target / 100: s += 1
+        return s
+    except: return None
 
 
 def _parse_attendance_table(soup: BeautifulSoup) -> dict | None:
-    records         = []
-    total_conducted = None
-    total_attended  = None
-    total_pct       = None
-
     table = soup.find("table")
-    if not table:
-        # Try div-based layout (some Moodle themes)
-        return None
+    if not table: return None
 
     raw_headers   = [th.get_text(strip=True) for th in table.find_all("th")]
     headers_lower = [h.lower() for h in raw_headers]
-    print(f"  📋 Headers detected: {raw_headers}")
+    print(f"  📋 Headers: {raw_headers}")
 
     def col_idx(*keys):
         for k in keys:
             for i, h in enumerate(headers_lower):
-                if k in h:
-                    return i
+                if k in h: return i
         return -1
 
     idx_subj     = col_idx("course", "subject", "name", "paper", "module")
     idx_total    = col_idx("total session", "total conducted", "total classes", "total")
-    idx_marked   = col_idx("marked")
     idx_attended = col_idx("attended session", "attended")
     idx_pct      = col_idx("percentage", "percent", "attendance %", "%")
 
@@ -512,29 +342,28 @@ def _parse_attendance_table(soup: BeautifulSoup) -> dict | None:
     if idx_attended < 0: idx_attended = 3
     if idx_pct      < 0: idx_pct      = 4
 
-    print(f"  📋 Using cols → name:{idx_subj} total:{idx_total} attended:{idx_attended} pct:{idx_pct}")
+    print(f"  📋 Columns → subj:{idx_subj} total:{idx_total} attended:{idx_attended} pct:{idx_pct}")
+
+    records = []
+    total_conducted = total_attended = total_pct = None
 
     for tr in table.find_all("tr")[1:]:
         tds   = tr.find_all("td")
-        if not tds:
-            continue
+        if not tds: continue
         cells = [td.get_text(strip=True) for td in tds]
-        if len(cells) < 3:
-            continue
+        if len(cells) < 3: continue
 
         subj = cells[idx_subj] if idx_subj < len(cells) else ""
         if not subj or re.search(r"total|grand|summary|conducted|session", subj, re.I):
             row_text = tr.get_text(" ", strip=True)
-            m_total  = re.search(r"conducted[^\d]*(\d+)", row_text, re.I)
-            m_att    = re.search(r"attended[^\d]*(\d+)", row_text, re.I)
-            m_pct2   = re.search(r"(\d+\.?\d*)\s*%", row_text)
-            if m_total: total_conducted = int(m_total.group(1))
-            if m_att:   total_attended  = int(m_att.group(1))
-            if m_pct2:  total_pct       = float(m_pct2.group(1))
+            m = re.search(r"conducted[^\d]*(\d+)", row_text, re.I)
+            if m: total_conducted = int(m.group(1))
+            m = re.search(r"attended[^\d]*(\d+)", row_text, re.I)
+            if m: total_attended = int(m.group(1))
+            m = re.search(r"(\d+\.?\d*)\s*%", row_text)
+            if m: total_pct = float(m.group(1))
             continue
-
-        if re.match(r"^\d+$", subj):
-            continue
+        if re.match(r"^\d+$", subj): continue
 
         total    = cells[idx_total]    if idx_total    < len(cells) else "—"
         attended = cells[idx_attended] if idx_attended < len(cells) else "—"
@@ -542,192 +371,197 @@ def _parse_attendance_table(soup: BeautifulSoup) -> dict | None:
 
         pct = _pct_float(pct_raw)
         if pct is None:
-            t = _pct_float(total)
-            a = _pct_float(attended)
-            if t and a and t > 0:
-                pct = round(a / t * 100, 2)
+            t, a = _pct_float(total), _pct_float(attended)
+            if t and a and t > 0: pct = round(a / t * 100, 2)
 
         records.append({
             "subject":    subj.strip(),
             "attended":   attended,
             "total":      total,
-            "percentage": f"{pct:.2f}%" if pct is not None else pct_raw,
+            "percentage": f"{pct:.1f}%" if pct is not None else pct_raw,
             "pct_float":  pct,
             "status":     _status(pct),
         })
 
     if not records:
+        print("  ⚠️  Table found but no records parsed.")
         return None
 
-    return {
-        "records":         records,
-        "total_conducted": total_conducted,
-        "total_attended":  total_attended,
-        "total_pct":       total_pct,
-    }
+    return {"records": records, "total_conducted": total_conducted,
+            "total_attended": total_attended, "total_pct": total_pct}
 
 
 def fetch_attendance(session: requests.Session) -> dict | None:
     """
-    Try multiple known attendance URL patterns.
-    On failure, dump a debug snippet so we can diagnose the correct URL.
-    Retries with a fresh login if the page appears to be a login redirect.
+    Try every URL in ATTENDANCE_URLS.
+    Re-login once if redirected to login page.
+    Follow attendance links found on any page.
+    Print debug snippets so the correct URL can be identified from Action logs.
     """
-    for att_url in ATTENDANCE_URLS:
-        print(f"  🌐 Trying attendance URL: {att_url}")
+    tried_urls: set = set()
+
+    def _get_and_parse(sess: requests.Session, url: str) -> dict | None:
+        if url in tried_urls: return None
+        tried_urls.add(url)
+        print(f"  🌐 Trying: {url}")
         try:
-            r    = session.get(att_url, timeout=25)
+            r    = sess.get(url, timeout=25)
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # Detect login redirect
-            if not _is_logged_in_page(soup, r.url):
-                print(f"  🔄 Got login redirect at {att_url} — re-logging in...")
-                session = login_to_lms()
-                r    = session.get(att_url, timeout=25)
-                soup = BeautifulSoup(r.text, "html.parser")
-                if not _is_logged_in_page(soup, r.url):
-                    print(f"  ❌ Still on login page after re-login. Skipping URL.")
-                    continue
+            # Redirect to login?
+            if _is_login_page(soup, r.url):
+                print("  🔄 Login redirect detected — re-logging in…")
+                new_sess = login_to_lms()
+                r2   = new_sess.get(url, timeout=25)
+                soup = BeautifulSoup(r2.text, "html.parser")
+                if _is_login_page(soup, r2.url):
+                    print("  ❌ Still on login page after re-login. Skipping.")
+                    return None
+                return _parse_and_follow(new_sess, soup, url)
 
-            # Try to find attendance table
-            result = _parse_attendance_table(soup)
-            if result:
-                print(f"  ✅ Attendance parsed from {att_url}")
-                return result
-
-            # No table found — check if page has any useful content
-            page_text = soup.get_text(" ", strip=True)[:500]
-            print(f"  ⚠️  No table at {att_url}. Page snippet: {page_text}")
-
-            # Try to find attendance links on this page and follow them
-            att_links = soup.find_all("a", href=re.compile(r"attendance", re.I))
-            for link in att_links[:3]:
-                link_url = link.get("href", "")
-                if not link_url.startswith("http"):
-                    link_url = LMS_BASE + link_url
-                print(f"      🔗 Following attendance link: {link_url}")
-                r2    = session.get(link_url, timeout=25)
-                soup2 = BeautifulSoup(r2.text, "html.parser")
-                result2 = _parse_attendance_table(soup2)
-                if result2:
-                    print(f"  ✅ Attendance parsed from followed link: {link_url}")
-                    return result2
-
+            return _parse_and_follow(sess, soup, url)
         except Exception as ex:
-            import traceback
-            print(f"  ❌ Error at {att_url}: {ex}")
-            traceback.print_exc()
+            print(f"  ❌ Request error at {url}: {ex}")
+            return None
 
-    print("  ❌ All attendance URLs failed.")
+    def _parse_and_follow(sess: requests.Session, soup: BeautifulSoup, source_url: str) -> dict | None:
+        result = _parse_attendance_table(soup)
+        if result:
+            return result
+
+        snippet = soup.get_text(" ", strip=True)
+        snippet = re.sub(r"\s+", " ", snippet)[:300]
+        print(f"  ⚠️  No table found. Page snippet: {snippet}")
+
+        # Follow any attendance-related links on the page
+        for a_tag in soup.find_all("a", href=True):
+            href = a_tag.get("href", "")
+            text = a_tag.get_text(strip=True).lower()
+            if re.search(r"attendance", href + text, re.I):
+                link_url = href if href.startswith("http") else LMS_BASE + href
+                if link_url in tried_urls: continue
+                print(f"  🔗 Following attendance link: {link_url}")
+                res = _get_and_parse(sess, link_url)
+                if res: return res
+        return None
+
+    for url in ATTENDANCE_URLS:
+        result = _get_and_parse(session, url)
+        if result:
+            return result
+
+    print("  ❌ All attendance URLs exhausted — could not parse attendance.")
     return None
 
 
 # ─────────────────────────────────────────────────────────────────
 # 5. DISCORD HELPERS
 # ─────────────────────────────────────────────────────────────────
-def _post(webhook: str, payload: dict) -> None:
+def _post_webhook(webhook: str, payload: dict) -> None:
     r = requests.post(webhook, json=payload, timeout=10)
     if r.status_code not in (200, 204):
         print(f"    ❌ Discord {r.status_code}: {r.text[:200]}")
 
+def _flush(webhook: str, embeds: list) -> None:
+    for i in range(0, len(embeds), EMBEDS_PER_PAYLOAD):
+        _post_webhook(webhook, {"embeds": embeds[i:i + EMBEDS_PER_PAYLOAD]})
 
-def _chunk_text(text: str, limit: int = DISCORD_EMBED_DESC_LIMIT) -> list[str]:
-    """Split text into chunks ≤ limit chars, breaking at sentence/word boundaries."""
-    if len(text) <= limit:
-        return [text]
+def _chunk_text(text: str, limit: int = EMBED_DESC_LIMIT) -> list[str]:
+    if len(text) <= limit: return [text]
     chunks = []
     while text:
         if len(text) <= limit:
-            chunks.append(text)
-            break
-        # Try to break at last sentence end within limit
+            chunks.append(text); break
         cut = text.rfind(". ", 0, limit)
-        if cut == -1:
-            cut = text.rfind(" ", 0, limit)
-        if cut == -1:
-            cut = limit
-        else:
-            cut += 1  # include the space/period
+        if cut == -1: cut = text.rfind(" ", 0, limit)
+        if cut == -1: cut = limit
+        else: cut += 1
         chunks.append(text[:cut].strip())
         text = text[cut:].strip()
     return chunks
 
 
-def _flush_embeds(webhook: str, embeds: list) -> None:
-    """Send embeds in batches of DISCORD_EMBEDS_PER_MSG."""
-    for i in range(0, len(embeds), DISCORD_EMBEDS_PER_MSG):
-        _post(webhook, {"embeds": embeds[i:i + DISCORD_EMBEDS_PER_MSG]})
-
-
 # ─────────────────────────────────────────────────────────────────
 # 6. DISCORD SENDERS
 # ─────────────────────────────────────────────────────────────────
-def send_announcements_to_discord(webhook: str, subject: dict, posts: list) -> None:
-    window = "past 1 hour" if RUN_MODE == "auto" else f"past {LOOKBACK_HOURS // 24} days"
+ALL_CLEAR_MESSAGES = [
+    "You're all caught up! No new posts this hour. ✨",
+    "Nothing new this hour — keep up the good work! 💪",
+    "All quiet on the LMS front this hour. 🎉",
+    "No new posts this hour. Relax, you're on top of it! 😌",
+    "Zero announcements this hour. Clean slate! 🧹",
+]
 
+def send_announcements_to_discord(webhook: str, subject: dict, posts: list) -> None:
+    now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    color   = subject["color"]
+
+    # ── No new posts ─────────────────────────────────────────────
     if not posts:
-        if RUN_MODE == "manual":
-            _post(webhook, {"embeds": [{
+        if RUN_MODE == "auto":
+            hour_seed = int(datetime.now().strftime("%H"))
+            msg = ALL_CLEAR_MESSAGES[hour_seed % len(ALL_CLEAR_MESSAGES)]
+            _flush(webhook, [{
                 "title":       f"{subject['emoji']} {subject['name']}",
-                "description": f"✅ No announcements in the {window}.",
-                "color":       0x95A5A6,
-                "footer":      {"text": "LMS Notifier • SIU Hyderabad"},
+                "description": msg,
+                "color":       0x57F287,
+                "footer":      {"text": f"LMS Notifier • {now_str}"},
                 "timestamp":   datetime.utcnow().isoformat() + "Z",
-            }]})
-        print(f"  📭 {subject['code']}: nothing new.")
+            }])
+        else:
+            _flush(webhook, [{
+                "title":       f"{subject['emoji']} {subject['name']}",
+                "description": f"✅ No announcements in the past {LOOKBACK_HOURS // 24} day(s).",
+                "color":       0x95A5A6,
+                "footer":      {"text": f"LMS Notifier • {now_str}"},
+                "timestamp":   datetime.utcnow().isoformat() + "Z",
+            }])
+        print(f"  📭 {subject['code']}: nothing new — sent all-clear.")
         return
 
-    # ── Header embed ─────────────────────────────────────────────
-    header_embed = {
-        "title": f"{subject['emoji']} {subject['name']}",
-        "description": (
-            f"**{len(posts)} new announcement(s)** in the {window}."
-            + ("  *(showing latest 9)*" if len(posts) > 9 else "")
-        ),
-        "color": subject["color"],
-        "footer":    {"text": "LMS Notifier • SIU Hyderabad"},
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-    }
-
-    all_embeds = [header_embed]
+    # ── Header ────────────────────────────────────────────────────
+    window = "past 1 hour" if RUN_MODE == "auto" else f"past {LOOKBACK_HOURS // 24} days"
+    all_embeds = [{
+        "title":       f"{subject['emoji']} {subject['name']}",
+        "description": f"📬 **{len(posts)} new announcement(s)** in the {window}.",
+        "color":       color,
+        "footer":      {"text": f"LMS Notifier • {now_str}"},
+        "timestamp":   datetime.utcnow().isoformat() + "Z",
+    }]
 
     for post in posts[:9]:
-        # ── Meta line ────────────────────────────────────────────
         meta_parts = []
-        if post["author"] not in ("Unknown", "", "—"):
-            meta_parts.append(f"👤 {post['author']}")
-        if post["date_str"] not in ("Unknown date", ""):
+        if post.get("author") not in ("Unknown", "", "—", None):
+            meta_parts.append(f"👤 **{post['author']}**")
+        if post.get("date_str") not in ("Unknown date", "", None):
             meta_parts.append(f"📅 {post['date_str']}")
         if post.get("replies") not in ("—", "", "0", None):
-            meta_parts.append(f"💬 {post['replies']} repl{'y' if post['replies'] == '1' else 'ies'}")
+            r_val = post["replies"]
+            meta_parts.append(f"💬 {r_val} repl{'y' if r_val == '1' else 'ies'}")
+
         meta_line = "  •  ".join(meta_parts)
+        body      = post.get("body", "").strip()
 
-        body = post.get("body", "").strip()
-
-        # ── Build description: meta + full body ───────────────────
+        # meta + blank line + full body
         if body:
-            full_desc = (meta_line + "\n\n" + body) if meta_line else body
+            full_desc = f"{meta_line}\n\n{body}" if meta_line else body
         else:
-            full_desc = meta_line or ""
+            full_desc = meta_line or "*(no body)*"
 
-        # ── Split body into chunks if > embed limit ───────────────
-        chunks = _chunk_text(full_desc) if full_desc else [""]
-
+        chunks = _chunk_text(full_desc)
         for idx, chunk in enumerate(chunks):
-            part_suffix = f" (part {idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
-            embed = {
-                "title":     f"📢 {post['title']}{part_suffix}" if idx == 0 else f"📢 {post['title']} (cont.)",
-                "url":       post["url"],
-                "color":     subject["color"],
-                "footer":    {"text": f"{subject['emoji']} {subject['name']} • LMS Notifier"},
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            }
-            if chunk:
-                embed["description"] = chunk
-            all_embeds.append(embed)
+            suffix = "" if idx == 0 else f" *(cont. {idx + 1}/{len(chunks)})*"
+            all_embeds.append({
+                "title":       f"📢 {post['title']}{suffix}",
+                "url":         post["url"],
+                "description": chunk,
+                "color":       color,
+                "footer":      {"text": f"{subject['emoji']} {subject['name']} • LMS Notifier"},
+                "timestamp":   datetime.utcnow().isoformat() + "Z",
+            })
 
-    _flush_embeds(webhook, all_embeds)
-    print(f"  ✅ {subject['code']}: sent {len(posts)} post(s) across {len(all_embeds)} embed(s).")
+    _flush(webhook, all_embeds)
+    print(f"  ✅ {subject['code']}: {len(posts)} post(s) → {len(all_embeds)} embed(s) sent.")
 
 
 def send_attendance_to_discord(data: dict | None) -> None:
@@ -735,18 +569,22 @@ def send_attendance_to_discord(data: dict | None) -> None:
         print("⚠️  WEBHOOK_ATTENDANCE not set — skipping.")
         return
 
+    now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
+
     if data is None:
-        _post(ATTENDANCE_WEBHOOK, {"embeds": [{
+        _post_webhook(ATTENDANCE_WEBHOOK, {"embeds": [{
             "title":       "📋 Attendance — Fetch Failed",
             "description": (
-                "Could not scrape the attendance page.\n"
-                "The LMS may have changed its URL or layout.\n\n"
-                "**Debug:** Check the GitHub Actions log for the URLs that were tried "
-                "and the page snippets printed. You may need to update `ATTENDANCE_URLS` "
-                "in the script with the correct path."
+                "❌ Could not scrape the attendance page.\n\n"
+                "**How to fix:**\n"
+                "1. Check the **GitHub Actions log** for this run\n"
+                "2. Find lines starting with `🌐 Trying:` to see which URLs were tried\n"
+                "3. Find `Page snippet:` lines to see what each page returned\n"
+                "4. Log into LMS manually → go to your attendance page → copy the URL\n"
+                "5. Add it to `ATTENDANCE_URLS` at the top of `lms_scraper.py`"
             ),
             "color":     0xE74C3C,
-            "footer":    {"text": "Attendance Bot • SIU Hyderabad"},
+            "footer":    {"text": f"Attendance Bot • SIU Hyderabad • {now_str}"},
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }]})
         return
@@ -756,6 +594,7 @@ def send_attendance_to_discord(data: dict | None) -> None:
     total_attended  = data.get("total_attended")
     total_pct       = data.get("total_pct")
 
+    # Sort: lowest % first
     records.sort(key=lambda r: r["pct_float"] if r["pct_float"] is not None else 999)
 
     fields = []
@@ -764,17 +603,16 @@ def send_attendance_to_discord(data: dict | None) -> None:
         att = rec["attended"]
         tot = rec["total"]
 
-        lines = [f"{rec['status']}  **{rec['percentage']}**  ({att} / {tot} classes)"]
+        lines = [f"{rec['status']}  **{rec['percentage']}**  —  {att} / {tot} classes"]
 
         if pct is not None and pct < 75:
-            needed = _classes_needed(att, tot, target=75.0)
-            if needed is not None:
-                lines.append(f"⚠️ Need **{needed}** more class(es) to reach 75%")
+            needed = _classes_needed(att, tot)
+            if needed: lines.append(f"┗ ⚠️ Need **{needed}** more to hit 75%")
 
         if pct is not None and pct >= 75:
-            can_skip = _classes_can_skip(att, tot, target=75.0)
-            if can_skip and can_skip > 0:
-                lines.append(f"✅ Can afford to skip **{can_skip}** class(es)")
+            skip = _classes_can_skip(att, tot)
+            if skip and skip > 0:
+                lines.append(f"┗ ✅ Can skip up to **{skip}** class(es)")
 
         fields.append({
             "name":   rec["subject"][:50],
@@ -790,29 +628,27 @@ def send_attendance_to_discord(data: dict | None) -> None:
     top_color  = 0xE74C3C if low_count else (0xF39C12 if border else 0x2ECC71)
 
     if total_conducted and total_attended:
-        overall_line = f"📚 Total: **{total_attended} / {total_conducted}** sessions"
-        overall_pct  = total_pct or round(total_attended / total_conducted * 100, 1)
-        overall_line += f"  →  **{overall_pct:.1f}%**"
+        ov_pct  = total_pct or round(total_attended / total_conducted * 100, 1)
+        overall = f"📚 **{total_attended} / {total_conducted}** sessions  →  **{ov_pct:.1f}%** overall"
     else:
-        overall_line = f"📊 Avg across subjects: **{avg_pct:.1f}%**"
+        overall = f"📊 Avg attendance: **{avg_pct:.1f}%**"
 
     summary = (
-        f"{overall_line}\n"
-        f"🔴 Low (<75%): **{low_count}**  •  "
-        f"🟡 Borderline (75–84%): **{border}**  •  "
+        f"{overall}\n"
+        f"\n"
+        f"🔴 Low (<75%): **{low_count}**\n"
+        f"🟡 Borderline (75–84%): **{border}**\n"
         f"🟢 Safe (≥85%): **{safe_count}**"
     )
 
-    embed = {
+    _post_webhook(ATTENDANCE_WEBHOOK, {"embeds": [{
         "title":       "📋 Attendance Report — SIU Hyderabad",
         "description": summary,
         "color":       top_color,
         "fields":      fields,
-        "footer":      {"text": f"Attendance Bot • SIU Hyderabad • {datetime.now().strftime('%d %b %Y, %I:%M %p')}"},
+        "footer":      {"text": f"Attendance Bot • SIU Hyderabad • {now_str}"},
         "timestamp":   datetime.utcnow().isoformat() + "Z",
-    }
-
-    _post(ATTENDANCE_WEBHOOK, {"embeds": [embed]})
+    }]})
     print(f"✅ Attendance sent — {len(records)} subjects.")
 
 
@@ -820,14 +656,10 @@ def send_attendance_to_discord(data: dict | None) -> None:
 # MAIN
 # ─────────────────────────────────────────────────────────────────
 def main():
-    window = (
-        "last 1 hour"
-        if RUN_MODE == "auto"
-        else f"last {LOOKBACK_HOURS // 24} days"
-    )
+    window = "last 1 hour" if RUN_MODE == "auto" else f"last {LOOKBACK_HOURS // 24} days"
 
     print("=" * 60)
-    print("🎓  LMS Notifier — SIU Hyderabad")
+    print("🎓  LMS Notifier — SIU Hyderabad  v3")
     print(f"⚙️   Mode     : {RUN_MODE.upper()}")
     print(f"📅  Lookback : {window}")
     print(f"🕐  Run time : {datetime.now().strftime('%d %b %Y  %H:%M:%S')}")
@@ -844,15 +676,17 @@ def main():
             send_announcements_to_discord(subject["webhook"], subject, posts)
             total_new += len(posts)
         except Exception as ex:
+            import traceback
             print(f"  ❌ Error: {ex}")
+            traceback.print_exc()
 
-    # ── Attendance ────────────────────────────────────────────────
+    # ── Attendance — every hour in AUTO; optional in MANUAL ───────
     run_attendance = (RUN_MODE == "auto") or (
         os.environ.get("FETCH_ATTENDANCE", "false").lower() == "true"
     )
 
     if run_attendance:
-        print("\n📋 Scraping attendance (fresh login)...")
+        print("\n📋 Scraping attendance (fresh login)…")
         try:
             att_session = login_to_lms()
             att_data    = fetch_attendance(att_session)
@@ -861,12 +695,12 @@ def main():
             send_attendance_to_discord(att_data)
         except Exception as ex:
             import traceback
-            print(f"  ❌ Attendance failed: {ex}")
+            print(f"  ❌ Attendance error: {ex}")
             traceback.print_exc()
             send_attendance_to_discord(None)
 
     print("\n" + "=" * 60)
-    print(f"✅ Finished — {total_new} announcement(s) dispatched.")
+    print(f"✅  Done — {total_new} announcement(s) dispatched.")
     print("=" * 60)
 
 
