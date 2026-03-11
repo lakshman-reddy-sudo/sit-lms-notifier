@@ -1,0 +1,49 @@
+name: 📢 LMS Announcement Notifier
+
+on:
+  workflow_dispatch:   # ← Manual trigger from GitHub Actions tab
+    inputs:
+      days:
+        description: "Days to look back for announcements"
+        required: false
+        default: "7"
+
+jobs:
+  notify:
+    name: Fetch & Send LMS Announcements
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: 🚀 Run LMS Notifier
+        env:
+          # ── LMS Credentials ──────────────────────────
+          LMS_USERNAME: ${{ secrets.LMS_USERNAME }}
+          LMS_PASSWORD: ${{ secrets.LMS_PASSWORD }}
+
+          # ── Subject Webhooks ─────────────────────────
+          WEBHOOK_CAREER_ESSENTIALS: ${{ secrets.WEBHOOK_CAREER_ESSENTIALS }}
+          WEBHOOK_COMPUTER_ARCH:     ${{ secrets.WEBHOOK_COMPUTER_ARCH }}
+          WEBHOOK_CREATIVE_THINKING: ${{ secrets.WEBHOOK_CREATIVE_THINKING }}
+          WEBHOOK_EDA:               ${{ secrets.WEBHOOK_EDA }}
+          WEBHOOK_ENV_SUSTAIN:       ${{ secrets.WEBHOOK_ENV_SUSTAIN }}
+          WEBHOOK_LINEAR_ALGEBRA:    ${{ secrets.WEBHOOK_LINEAR_ALGEBRA }}
+          WEBHOOK_MICROCONTROLLERS:  ${{ secrets.WEBHOOK_MICROCONTROLLERS }}
+          WEBHOOK_PYTHON:            ${{ secrets.WEBHOOK_PYTHON }}
+          WEBHOOK_SOFTWARE_ENG:      ${{ secrets.WEBHOOK_SOFTWARE_ENG }}
+          WEBHOOK_TPCS:              ${{ secrets.WEBHOOK_TPCS }}
+
+          # ── Attendance Webhook ────────────────────────
+          WEBHOOK_ATTENDANCE:        ${{ secrets.WEBHOOK_ATTENDANCE }}
+
+        run: python lms_scraper.py
