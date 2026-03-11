@@ -11,6 +11,9 @@ DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
 
 CACHE_FILE = "cache.json"
 
+# Only notify for courses containing this keyword
+SEM_FILTER = "SEM_II"
+
 session = requests.Session()
 
 
@@ -71,12 +74,41 @@ def fetch_timeline(sesskey):
 
 def clean_html(html):
     clean = re.sub(r'<.*?>', '', html)
+    # Collapse 3+ newlines down to 2
+    clean = re.sub(r'\n{3,}', '\n\n', clean)
     return clean.strip()
+
+
+def is_sem2_course(course_name):
+    """Return True only if the course belongs to Semester II."""
+    return SEM_FILTER.lower() in course_name.lower()
+
+
+def format_discord_msg(course, name, message, attachments):
+    """
+    Build the Discord message with double blank lines between
+    each field for clean readability.
+    """
+    return (
+        "📢  **LMS UPDATE — SEM II**"
+        "\n\n\n"
+        f"📚  **Course:**\n{course}"
+        "\n\n\n"
+        f"📌  **Title:**\n{name}"
+        "\n\n\n"
+        f"💬  **Message:**\n{message}"
+        "\n\n\n"
+        f"📎  **Attachments:** {attachments}"
+        "\n\n"
+        "─────────────────────────"
+    )
 
 
 def main():
     if not USERNAME or not PASSWORD or not DISCORD_WEBHOOK:
-        raise RuntimeError("One or more required env vars are missing: LMS_USER, LMS_PASS, WEBHOOK_URL")
+        raise RuntimeError(
+            "One or more required env vars are missing: LMS_USER, LMS_PASS, WEBHOOK_URL"
+        )
 
     login()
     sesskey = get_sesskey()
@@ -84,6 +116,7 @@ def main():
     events = fetch_timeline(sesskey)
 
     new_events = 0
+
     for item in events:
         if "data" not in item:
             print(f"[WARN] Skipping item with no 'data' key: {item}")
@@ -92,31 +125,31 @@ def main():
         event_list = item["data"].get("events", [])
 
         for e in event_list:
-            name = e.get("name", "")
+            name        = e.get("name", "")
             description = e.get("description", "")
-            course = e.get("course", {}).get("fullname", "")
-            key = name + course
+            course      = e.get("course", {}).get("fullname", "")
+            key         = name + course
 
+            # ── Skip anything that isn't a SEM_II course ──
+            if not is_sem2_course(course):
+                print(f"[SKIP] Not SEM_II course: {course}")
+                continue
+
+            # ── Skip if already notified ──
             if key in cache:
                 continue
 
-            message = clean_html(description)
-            attachments = "Present" if "pluginfile.php" in description else "None"
+            message     = clean_html(description)
+            attachments = "✅  Present" if "pluginfile.php" in description else "❌  None"
 
-            discord_msg = (
-                f"📢 **LMS UPDATE**\n\n"
-                f"**Course:** {course}\n"
-                f"**Title:** {name}\n\n"
-                f"**Message:**\n{message}\n\n"
-                f"**Attachments:** {attachments}"
-            )
-
+            discord_msg = format_discord_msg(course, name, message, attachments)
             send_discord(discord_msg)
             cache.append(key)
             new_events += 1
+            print(f"[SENT] {course} — {name}")
 
     save_cache(cache)
-    print(f"Done. {new_events} new event(s) sent to Discord.")
+    print(f"\nDone. {new_events} new SEM II event(s) sent to Discord.")
 
 
 if __name__ == "__main__":
