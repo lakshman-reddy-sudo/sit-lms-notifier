@@ -1,16 +1,16 @@
 name: LMS Notifier
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:       # Manual trigger → sends ALL SEM II announcements
   schedule:
-    - cron: '0 * * * *'   # Runs every hour
+    - cron: '0 * * * *'   # Scheduled → sends only new announcements
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write   # Needed to commit cache.json back to repo
+      contents: write      # Needed to commit cache.json back to repo
 
     steps:
       - name: Checkout repo
@@ -26,14 +26,18 @@ jobs:
 
       - name: Run bot
         env:
-          LMS_USER: ${{ secrets.LMS_USER }}
-          LMS_PASS: ${{ secrets.LMS_PASS }}
+          LMS_USER:    ${{ secrets.LMS_USER }}
+          LMS_PASS:    ${{ secrets.LMS_PASS }}
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          # Passes "true" only when triggered manually via the Actions UI
+          MANUAL_RUN:  ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: python lms_bot.py
 
-      # CRITICAL: Save cache.json back to the repo so duplicate
-      # notifications aren't sent on the next run.
+      # Only commit cache on scheduled runs.
+      # Manual runs don't touch the cache so scheduled runs
+      # still catch new events correctly afterwards.
       - name: Commit updated cache
+        if: github.event_name == 'schedule'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
