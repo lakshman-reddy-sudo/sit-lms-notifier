@@ -15,7 +15,7 @@ MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
 CACHE_FILE = "cache.json"
 
 # Only notify for courses containing this keyword (case-insensitive)
-SEM_FILTER = "CSE_II SEM"
+SEM_FILTER = "(CSE_II SEM)"
 
 session = requests.Session()
 
