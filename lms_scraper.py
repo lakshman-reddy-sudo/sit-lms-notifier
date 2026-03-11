@@ -342,6 +342,27 @@ def fetch_post_full(session: requests.Session, post_url: str) -> tuple[str, str,
                     body = re.sub(r"\s+", " ", main.get_text(" ", strip=True)).strip()
                     print(f"      📝 Body via get_text fallback ({len(body)} chars)")
 
+        # Strip Moodle UI noise that bleeds into body text
+        # Common prefixes/suffixes added by get_text fallback
+        noise_prefixes = [
+            "Settings Star this discussion",
+            "Star this discussion",
+            "Permalink",
+        ]
+        noise_suffixes = ["Permalink", "Reply", "Edit", "Delete", "Export to portfolio"]
+
+        for prefix in noise_prefixes:
+            if body.startswith(prefix):
+                body = body[len(prefix):].lstrip(" -–—")
+
+        for suffix in noise_suffixes:
+            if body.endswith(suffix):
+                body = body[:-len(suffix)].rstrip(" -–—")
+
+        # Also strip the post title if it got duplicated at the start
+        # (Moodle sometimes repeats subject/title as first line of body)
+        body = body.strip()
+
         return author, date_str, body
 
     except Exception as ex:
@@ -455,98 +476,58 @@ def _classes_can_skip(present: str, total: str, target: float = 75.0) -> int | N
 
 def _parse_attendance_table(soup: BeautifulSoup) -> dict | None:
     """
-    SIU LMS table structure (confirmed from live logs):
-
-    ONE header <tr> with ALL <th>:
-      [Course Name, Total Sessions, Marked Sessions, Attended Sessions, Percentage,
-       Subject1, Subject2, ... SubjectN]
-
-    Followed by N data <tr>, each with ONLY <td> (no subject name in td):
-      [total, marked, attended, pct]   ← row 1 = Subject1
-      [total, marked, attended, pct]   ← row 2 = Subject2
-      ...
-
-    So we zip header_ths[5:] with data_rows to build records.
-    Falls back to regex on page text if HTML parsing fails.
+    Standard table — one <tr> per subject with <td> cells.
+    Header: Course Name | Total Sessions | Marked Sessions | Attended Sessions | Percentage
+    Data:   Linear Algebra...  | 17 | 17 | 7 | 41.18%
+    Footer: Total Conducted Session: 141 / Total Attended: 100 / Total Percentage: 70.9%
     """
     table = soup.find("table")
-    if not table: return None
-
-    all_rows = table.find_all("tr")
-    if not all_rows: return None
-
-    # ── Extract header <th> list ──────────────────────────────────
-    header_ths = [th.get_text(strip=True) for th in all_rows[0].find_all("th")]
-    print(f"  📋 Header ths ({len(header_ths)}): {header_ths}")
-
-    if not header_ths:
-        print("  ⚠️  No <th> in first row.")
+    if not table:
+        print("  ⚠️  No <table> found on page.")
         return None
 
-    # ── Find where metric headers end and subject names begin ─────
-    metric_keywords = {"course", "total", "marked", "attended", "percentage", "percent", "%"}
-    subj_start = next(
-        (i for i, h in enumerate(header_ths)
-         if not any(k in h.lower() for k in metric_keywords)),
-        -1
-    )
-
-    if subj_start < 0:
-        print("  ⚠️  No subject column headers found in <th> row.")
+    rows = table.find_all("tr")
+    print(f"  📋 Table has {len(rows)} rows total")
+    if not rows:
         return None
 
-    metric_ths = header_ths[:subj_start]   # e.g. [Course Name, Total, Marked, Attended, %]
-    subject_ths = header_ths[subj_start:]   # e.g. [Linear Algebra, Micro, ...]
-    print(f"  📋 Metric cols: {metric_ths}")
-    print(f"  📋 Subjects ({len(subject_ths)}): {subject_ths}")
-
-    # Find column indices within metric_ths
-    def midx(*keys):
-        for k in keys:
-            for i, h in enumerate(metric_ths):
-                if k.lower() in h.lower(): return i
-        return -1
-
-    # These are 0-based indices within each data row's <td> list
-    # data rows have NO subject td — just the metric values
-    # BUT the header has "Course Name" as first metric col (idx 0),
-    # so data rows may start from td[0]=total or td[0] may be empty/subject ref
-    # We'll detect by checking if first td is numeric
-
-    idx_total    = midx("total session", "total conducted", "total")
-    idx_marked   = midx("marked")
-    idx_attended = midx("attended session", "attended")
-    idx_pct      = midx("percentage", "percent", "%")
-
-    # Subtract 1 because "Course Name" col has no td equivalent in data rows
-    # (subject name is implied by row order, not present as a td)
-    offset = 1  # Course Name col is th-only
-    idx_total    = max(0, idx_total    - offset) if idx_total    >= 0 else 0
-    idx_attended = max(0, idx_attended - offset) if idx_attended >= 0 else 2
-    idx_pct      = max(0, idx_pct      - offset) if idx_pct      >= 0 else 3
-
-    print(f"  📋 Data col indices → total:{idx_total} attended:{idx_attended} pct:{idx_pct}")
-
-    # ── Collect data rows (td-only rows, skip header) ─────────────
-    data_rows = []
-    for tr in all_rows[1:]:
-        tds = tr.find_all("td")
-        if tds:
-            data_rows.append([td.get_text(strip=True) for td in tds])
-
-    print(f"  📋 Data rows found: {len(data_rows)}")
-
-    if not data_rows:
-        print("  ⚠️  No <td> data rows found.")
-        return _parse_attendance_from_text(soup)
-
-    # ── Zip subjects with data rows ───────────────────────────────
     records = []
-    for subj, cells in zip(subject_ths, data_rows):
-        if not cells: continue
-        total    = cells[idx_total]    if idx_total    < len(cells) else "—"
-        attended = cells[idx_attended] if idx_attended < len(cells) else "—"
-        pct_raw  = cells[idx_pct]      if idx_pct      < len(cells) else "—"
+    total_conducted = total_attended = total_pct = None
+
+    for tr in rows:
+        cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+        if not cells:
+            continue
+
+        first = cells[0].strip()
+
+        # Skip the header row
+        if any(k in first.lower() for k in ("course", "subject", "name")):
+            print(f"  📋 Header row: {cells}")
+            continue
+
+        # Footer rows — capture totals
+        row_text = " ".join(cells)
+        if re.search(r"total|grand|percentage", row_text, re.I) and not re.search(r"\(CSE", row_text):
+            m = re.search(r"total conducted[^\d]*(\d+)", row_text, re.I)
+            if m: total_conducted = int(m.group(1))
+            m = re.search(r"total attended[^\d]*(\d+)", row_text, re.I)
+            if m: total_attended = int(m.group(1))
+            m = re.search(r"([\d.]+)\s*%", row_text)
+            if m: total_pct = float(m.group(1))
+            print(f"  📋 Footer row: {row_text[:80]}")
+            continue
+
+        # Skip rows with too few cells
+        if len(cells) < 4:
+            continue
+
+        # Subject row: cells = [name, total, marked, attended, pct]
+        subj    = cells[0]
+        total   = cells[1]
+        # cells[2] = marked — skip
+        attended = cells[3] if len(cells) > 3 else cells[2]
+        pct_raw  = cells[4] if len(cells) > 4 else cells[-1]
 
         pct = _pct_float(pct_raw)
         if pct is None:
@@ -555,62 +536,60 @@ def _parse_attendance_table(soup: BeautifulSoup) -> dict | None:
                 pct = round(a_f / t_f * 100, 2)
 
         records.append({
-            "subject":    subj.strip(),
-            "attended":   attended,
+            "subject":    subj,
             "total":      total,
+            "attended":   attended,
             "percentage": f"{pct:.1f}%" if pct is not None else pct_raw,
             "pct_float":  pct,
             "status":     _status(pct),
         })
+        print(f"  ✅ {subj[:40]} → {attended}/{total} = {pct_raw}")
 
-    if records:
-        print(f"  ✅ Parsed {len(records)} records via zip method.")
-        return {"records": records, "total_conducted": None,
-                "total_attended": None, "total_pct": None}
+    if not records:
+        print("  ⚠️  0 records — trying regex fallback on page text...")
+        return _parse_attendance_from_text(soup)
 
-    # ── Fallback: regex on page text ──────────────────────────────
-    print("  ⚠️  Zip method yielded 0 records — falling back to text regex.")
-    return _parse_attendance_from_text(soup)
+    return {
+        "records":         records,
+        "total_conducted": total_conducted,
+        "total_attended":  total_attended,
+        "total_pct":       total_pct,
+    }
 
 
 def _parse_attendance_from_text(soup: BeautifulSoup) -> dict | None:
-    """
-    Last-resort: parse attendance data directly from the page text.
-    Matches pattern: "Subject Name (semester) total marked attended pct%"
-    """
-    page_text = soup.get_text(" ", strip=True)
-    page_text = re.sub(r"\s+", " ", page_text)
-    print(f"  📋 Regex fallback on page text ({len(page_text)} chars)")
-
-    # Pattern: name ending with (semester info) then 3+ numbers then a percentage
+    """Regex fallback: pull data directly from visible page text."""
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    # Match: "Subject Name (CSE_II SEM) 17 17 7 41.18%"
     pattern = re.compile(
-        r"([A-Za-z][A-Za-z0-9 ,&()\/\-]+"         # subject name
-        r"\([A-Za-z0-9_\s]+\))"                   # (semester)
-        r"\s+(\d+)\s+\d+\s+(\d+)\s+([\d.]+%)",  # total, marked, attended, pct
+        r"([A-Za-z][A-Za-z0-9 ,&()\/\-]+?\([A-Za-z0-9_\s]+\))"
+        r"\s+(\d+)\s+\d+\s+(\d+)\s+([\d.]+%)",
         re.I
     )
     records = []
-    for m in pattern.finditer(page_text):
-        subj     = m.group(1).strip()
-        total    = m.group(2)
-        attended = m.group(3)
-        pct_raw  = m.group(4)
-        pct = _pct_float(pct_raw)
+    for m in pattern.finditer(text):
+        pct = _pct_float(m.group(4))
         records.append({
-            "subject":    subj,
-            "attended":   attended,
-            "total":      total,
-            "percentage": f"{pct:.1f}%" if pct is not None else pct_raw,
+            "subject":    m.group(1).strip(),
+            "total":      m.group(2),
+            "attended":   m.group(3),
+            "percentage": f"{pct:.1f}%" if pct is not None else m.group(4),
             "pct_float":  pct,
             "status":     _status(pct),
         })
-
     if records:
-        print(f"  ✅ Regex fallback parsed {len(records)} records.")
-        return {"records": records, "total_conducted": None,
-                "total_attended": None, "total_pct": None}
-
-    print("  ❌ Regex fallback also found 0 records.")
+        print(f"  ✅ Regex fallback got {len(records)} records.")
+        # grab totals too
+        total_conducted = total_attended = total_pct = None
+        m = re.search(r"Total Conducted Session:\s*(\d+)", text, re.I)
+        if m: total_conducted = int(m.group(1))
+        m = re.search(r"Total Attended Session:\s*(\d+)", text, re.I)
+        if m: total_attended = int(m.group(1))
+        m = re.search(r"Total Percentage:\s*([\d.]+)", text, re.I)
+        if m: total_pct = float(m.group(1))
+        return {"records": records, "total_conducted": total_conducted,
+                "total_attended": total_attended, "total_pct": total_pct}
+    print("  ❌ Regex fallback also found nothing.")
     return None
 
 
