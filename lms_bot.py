@@ -11,8 +11,10 @@ DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
 
 CACHE_FILE = "cache.json"
 
-# Only notify for courses containing this keyword
-SEM_FILTER = "SEM_II"
+# Only notify for courses containing this keyword.
+# Your LMS names Sem II courses like: "Exploratory Data Analysis (CSE_II SEM)"
+# So we match on "II SEM" which is present in all Sem II course names.
+SEM_FILTER = "II SEM"
 
 session = requests.Session()
 
@@ -132,7 +134,7 @@ def main():
 
             # ── Skip anything that isn't a SEM_II course ──
             if not is_sem2_course(course):
-                print(f"[SKIP] Not SEM_II course: {course}")
+                print(f"[SKIP] Not a SEM II course: {course}")
                 continue
 
             # ── Skip if already notified ──
