@@ -3,6 +3,7 @@ import time
 import requests
 import json
 import os
+from datetime import datetime, timezone
 
 LMS_URL = "https://lmssithyd.siu.edu.in"
 
@@ -15,7 +16,7 @@ MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
 
 CACHE_FILE = "cache.json"
 
-# Exact course names from your LMS — only announcements from these will be sent
+# Exact course names — we'll auto-discover their forum IDs by scraping
 TARGET_COURSES = {
     "Career Essentials - I (CSE_II SEM)",
     "Computer Architecture and Organization (CSE_II SEM)",
@@ -28,6 +29,9 @@ TARGET_COURSES = {
     "Software Engineering (CSE_II SEM)",
     "Technical and Professional Communication Skills (CSE_II SEM)",
 }
+
+# On manual run: show posts from this many days back
+MANUAL_LOOKBACK_DAYS = 30
 
 DISCORD_LIMIT   = 2000
 TRUNCATION_NOTE = "\n\n... *(message truncated — check LMS for full content)*"
@@ -63,7 +67,7 @@ def save_cache(data):
 def login():
     r = session.get(f"{LMS_URL}/login/index.php")
     if 'name="logintoken" value="' not in r.text:
-        raise RuntimeError("Could not find login token — LMS page structure may have changed.")
+        raise RuntimeError("Could not find login token.")
     token = r.text.split('name="logintoken" value="')[1].split('"')[0]
     payload = {
         "username": USERNAME,
@@ -85,65 +89,145 @@ def get_sesskey():
     return sesskey
 
 
-# ─── Timeline ─────────────────────────────────────────────────────────────────
+# ─── Course discovery ─────────────────────────────────────────────────────────
 
-def fetch_timeline(sesskey):
+def get_course_links():
     """
-    On MANUAL runs  → fetch events from the past 7 days up to 30 days ahead.
-                      This surfaces recently-posted announcements that already
-                      passed or have no strict deadline.
-    On SCHEDULED runs → fetch only upcoming events (no timesortfrom), which
-                        is the default Moodle behaviour.
+    Scrape the dashboard to find course page URLs.
+    Returns dict: {course_fullname: course_url}
     """
-    url  = f"{LMS_URL}/lib/ajax/service.php?sesskey={sesskey}"
-    now  = int(time.time())
+    page = session.get(f"{LMS_URL}/my/")
+    text = page.text
 
-    args = {"limitnum": 50}
+    # Moodle renders course links as /course/view.php?id=NNN
+    course_links = {}
+    for match in re.finditer(r'href="([^"]+/course/view\.php\?id=(\d+))"[^>]*>(.*?)</a>', text, re.DOTALL):
+        url        = match.group(1)
+        name_raw   = re.sub(r'<.*?>', '', match.group(3)).strip()
+        if name_raw in TARGET_COURSES:
+            course_links[name_raw] = url if url.startswith("http") else LMS_URL + url
 
-    if MANUAL_RUN:
-        args["timesortfrom"] = now - (7 * 24 * 60 * 60)   # 7 days ago
-        args["timesortto"]   = now + (30 * 24 * 60 * 60)  # 30 days ahead
-        print("[INFO] Fetching events from the past 7 days + next 30 days.")
-    else:
-        # Scheduled: only look ahead so we catch new deadlines as they appear
-        args["timesortfrom"] = now - (60 * 60)             # 1 hr back (safety buffer)
-        args["timesortto"]   = now + (30 * 24 * 60 * 60)  # 30 days ahead
-        print("[INFO] Fetching upcoming events.")
+    print(f"[INFO] Found {len(course_links)} target course(s) on dashboard.")
+    return course_links
 
-    payload = [{
-        "index": 0,
-        "methodname": "core_calendar_get_action_events_by_timesort",
-        "args": args
-    }]
 
-    r = session.post(url, json=payload)
-    r.raise_for_status()
-    return r.json()
+# ─── Forum discovery ──────────────────────────────────────────────────────────
+
+def get_announcement_forum_url(course_url, course_name):
+    """
+    Scrape a course page to find the Announcements forum link.
+    Moodle always has one forum with the word 'Announcement' in it.
+    Returns forum URL or None.
+    """
+    page = session.get(course_url)
+    text = page.text
+
+    # Look for forum links — Moodle uses /mod/forum/view.php?id=NNN
+    for match in re.finditer(r'href="([^"]+/mod/forum/view\.php\?id=\d+)"[^>]*>(.*?)</a>', text, re.DOTALL):
+        url        = match.group(1)
+        label      = re.sub(r'<.*?>', '', match.group(2)).strip().lower()
+        if "announce" in label or "news" in label:
+            full_url = url if url.startswith("http") else LMS_URL + url
+            print(f"[INFO] Found announcement forum for '{course_name}': {full_url}")
+            return full_url
+
+    print(f"[WARN] No announcement forum found for '{course_name}' — skipping.")
+    return None
+
+
+# ─── Forum scraping ───────────────────────────────────────────────────────────
+
+def scrape_forum_posts(forum_url):
+    """
+    Scrape a Moodle forum page and return list of dicts:
+      {title, author, timestamp, post_url, message_preview}
+    """
+    page  = session.get(forum_url)
+    text  = page.text
+    posts = []
+
+    # Each discussion row in Moodle contains a link to the discussion
+    # Pattern: /mod/forum/discuss.php?d=NNN
+    for match in re.finditer(
+        r'href="([^"]+/mod/forum/discuss\.php\?d=(\d+))"[^>]*>(.*?)</a>',
+        text, re.DOTALL
+    ):
+        url      = match.group(1)
+        disc_id  = match.group(2)
+        title    = re.sub(r'<.*?>', '', match.group(3)).strip()
+        if not title:
+            continue
+        full_url = url if url.startswith("http") else LMS_URL + url
+        posts.append({
+            "disc_id":  disc_id,
+            "title":    title,
+            "post_url": full_url,
+        })
+
+    # Deduplicate by disc_id (same link may appear multiple times in the DOM)
+    seen    = set()
+    unique  = []
+    for p in posts:
+        if p["disc_id"] not in seen:
+            seen.add(p["disc_id"])
+            unique.append(p)
+
+    return unique
+
+
+def scrape_discussion_body(discuss_url):
+    """
+    Fetch the first post body + author from a discussion page.
+    Returns (author, message_text)
+    """
+    page = session.get(discuss_url)
+    text = page.text
+
+    author  = "Unknown"
+    message = ""
+
+    # Author is usually in a link inside the post header
+    author_match = re.search(
+        r'class="[^"]*author[^"]*"[^>]*>.*?href="[^"]*"[^>]*>(.*?)</a>',
+        text, re.DOTALL
+    )
+    if author_match:
+        author = re.sub(r'<.*?>', '', author_match.group(1)).strip()
+
+    # Message body is inside div class="posting" or class="post-content-container"
+    body_match = re.search(
+        r'class="[^"]*(posting|post-content-container)[^"]*"[^>]*>(.*?)</div>',
+        text, re.DOTALL
+    )
+    if body_match:
+        message = clean_html(body_match.group(2))
+
+    return author, message
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-def is_target_course(course_name):
-    return course_name in TARGET_COURSES
-
-
 def clean_html(html):
     clean = re.sub(r'<.*?>', '', html or '')
+    clean = re.sub(r'&amp;',  '&',  clean)
+    clean = re.sub(r'&lt;',   '<',  clean)
+    clean = re.sub(r'&gt;',   '>',  clean)
+    clean = re.sub(r'&nbsp;', ' ',  clean)
     clean = re.sub(r'\n{3,}', '\n\n', clean)
     return clean.strip()
 
 
-def format_discord_msg(course, title, message, attachments, tag=""):
+def format_discord_msg(course, title, author, message, post_url, tag=""):
     header = f"📢  **LMS ANNOUNCEMENT — CSE II SEM**  {tag}".strip()
 
-    # Measure frame size without body so we know how much space is left
     frame_shell = (
         f"{header}\n\n\n"
         f"📚  **Course:**\n{course}\n\n\n"
         f"📌  **Title:**\n{title}\n\n\n"
-        f"💬  **Message:**\n"          # body goes here
+        f"✍️  **Posted by:** {author}\n\n\n"
+        f"💬  **Message:**\n"
         f"\n\n\n"
-        f"📎  **Attachments:** {attachments}\n\n"
+        f"🔗  **Link:** {post_url}\n\n"
         "─────────────────────────"
     )
 
@@ -155,8 +239,9 @@ def format_discord_msg(course, title, message, attachments, tag=""):
         f"{header}\n\n\n"
         f"📚  **Course:**\n{course}\n\n\n"
         f"📌  **Title:**\n{title}\n\n\n"
+        f"✍️  **Posted by:** {author}\n\n\n"
         f"💬  **Message:**\n{message}\n\n\n"
-        f"📎  **Attachments:** {attachments}\n\n"
+        f"🔗  **Link:** {post_url}\n\n"
         "─────────────────────────"
     )
 
@@ -169,59 +254,69 @@ def main():
             "One or more required env vars are missing: LMS_USER, LMS_PASS, WEBHOOK_URL"
         )
 
-    mode = "MANUAL (past 7 days + next 30 days)" if MANUAL_RUN else "SCHEDULED (new events only)"
+    mode = f"MANUAL (last {MANUAL_LOOKBACK_DAYS} days, ignoring cache)" if MANUAL_RUN else "SCHEDULED (new posts only)"
     print(f"[MODE] {mode}")
 
     login()
-    sesskey = get_sesskey()
-    cache   = load_cache()
-    events  = fetch_timeline(sesskey)
+    get_sesskey()   # keeps session alive / validates login
+    cache = load_cache()
+
+    # Step 1 — find course pages on the dashboard
+    course_links = get_course_links()
+
+    if not course_links:
+        print("[WARN] No target courses found on dashboard. Check course names match exactly.")
+        return
 
     sent = 0
 
     if MANUAL_RUN:
         send_discord(
-            "📋  **MANUAL FETCH — CSE II SEM ANNOUNCEMENTS (LAST 7 DAYS)**\n\n\n"
-            "Below are all CSE II SEM announcements from the past week.\n"
+            f"📋  **MANUAL FETCH — CSE II SEM ANNOUNCEMENTS**\n\n\n"
+            f"Fetching all announcements from the last {MANUAL_LOOKBACK_DAYS} days.\n"
             "─────────────────────────"
         )
 
-    for item in events:
-        if "data" not in item:
-            print("[WARN] Skipping item with no 'data' key.")
+    # Step 2 — for each course, find its announcement forum and scrape posts
+    for course_name, course_url in course_links.items():
+        forum_url = get_announcement_forum_url(course_url, course_name)
+        if not forum_url:
             continue
 
-        event_list = item["data"].get("events", [])
+        posts = scrape_forum_posts(forum_url)
+        print(f"[INFO] '{course_name}' — {len(posts)} post(s) found.")
 
-        for e in event_list:
-            name        = e.get("name", "")
-            description = e.get("description", "")
-            course      = e.get("course", {}).get("fullname", "")
-            key         = name + course
+        for post in posts:
+            key = f"{course_name}_{post['disc_id']}"
 
-            # Skip courses not in the whitelist
-            if not is_target_course(course):
-                print(f"[SKIP] {course}")
-                continue
-
-            # Scheduled mode: skip already-notified events
+            # Scheduled: skip already-notified posts
             if not MANUAL_RUN and key in cache:
                 continue
 
-            message     = clean_html(description)
-            attachments = "✅  Present" if "pluginfile.php" in description else "❌  None"
-            tag         = "*(manual)*" if MANUAL_RUN else ""
+            # Fetch the full post body
+            author, message = scrape_discussion_body(post["post_url"])
+            tag             = "*(manual)*" if MANUAL_RUN else ""
 
-            discord_msg = format_discord_msg(course, name, message, attachments, tag)
+            discord_msg = format_discord_msg(
+                course_name,
+                post["title"],
+                author,
+                message,
+                post["post_url"],
+                tag
+            )
+
             send_discord(discord_msg)
             sent += 1
-            print(f"[SENT] {course} — {name}")
+            print(f"[SENT] {course_name} — {post['title']}")
 
             # Only update cache on scheduled runs
             if not MANUAL_RUN:
                 cache.append(key)
 
-    # Save cache only on scheduled runs
+            # Small delay to avoid hammering the LMS
+            time.sleep(0.5)
+
     if not MANUAL_RUN:
         save_cache(cache)
 
