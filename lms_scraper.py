@@ -13,7 +13,6 @@ Fixes vs v3:
 import os
 import re
 import requests
-import threading
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 
@@ -23,18 +22,11 @@ from datetime import datetime, timedelta
 LMS_BASE      = "https://lmssithyd.siu.edu.in"
 LMS_LOGIN_URL = f"{LMS_BASE}/login/index.php"
 
-# Attendance URLs tried in order — add the real one at the top once known
-ATTENDANCE_URLS = [
-    f"{LMS_BASE}/attendance-report/Student-Attendance/index.php",
-    f"{LMS_BASE}/attendance-report/index.php",
-    f"{LMS_BASE}/local/attendance/index.php",
-    f"{LMS_BASE}/local/attendancereport/index.php",
-    f"{LMS_BASE}/report/attendance/index.php",
-    f"{LMS_BASE}/blocks/attendance/index.php",
-    f"{LMS_BASE}/mod/attendance/view.php",
-]
-
-ATTENDANCE_TIMEOUT = 10   # seconds per URL — prevents 5-min hangs
+# The confirmed working attendance URL.
+# After login we always warm up by visiting the dashboard first,
+# then navigate here — this ensures all session cookies are set properly.
+ATTENDANCE_URL     = f"{LMS_BASE}/attendance-report/Student-Attendance/index.php"
+ATTENDANCE_TIMEOUT = 20   # seconds for attendance page fetch
 REQUEST_TIMEOUT    = 15   # general page fetch timeout
 
 LMS_USERNAME = os.environ["LMS_USERNAME"]
@@ -73,7 +65,15 @@ ALL_CLEAR_MSGS = [
 # ─────────────────────────────────────────────────────────────────
 # 1. LOGIN
 # ─────────────────────────────────────────────────────────────────
-def login_to_lms() -> requests.Session:
+def login_to_lms(warm_up: bool = False) -> requests.Session:
+    """
+    Log in to LMS and return an authenticated session.
+
+    warm_up=True  →  After login, visit the dashboard then prime the
+    attendance URL. This seeds all required session cookies exactly as
+    a real browser would, preventing the stale-session issue where the
+    attendance page silently uses an expired previous session.
+    """
     session = requests.Session()
     session.headers.update({
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -83,7 +83,7 @@ def login_to_lms() -> requests.Session:
         "Connection":      "keep-alive",
     })
 
-    print("  🌐 Fetching login page…")
+    print("  🌐 Fetching login page...")
     r    = session.get(LMS_LOGIN_URL, timeout=REQUEST_TIMEOUT)
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -99,7 +99,7 @@ def login_to_lms() -> requests.Session:
     soup_after = BeautifulSoup(r.text, "html.parser")
 
     if soup_after.find(id="loginerrormessage") or soup_after.find(class_="loginerrormessage"):
-        raise RuntimeError("❌ LMS login failed — wrong credentials?")
+        raise RuntimeError("❌ LMS login failed - wrong credentials?")
 
     logged_in = (
         "/my/" in r.url
@@ -108,7 +108,24 @@ def login_to_lms() -> requests.Session:
         or soup_after.find(attrs={"class": lambda c: c and "usermenu" in c}) is not None
         or soup_after.find("div", {"id": "page-my-index"}) is not None
     )
-    print(f"  {'✅ Logged in.' if logged_in else '⚠️  Login unclear — proceeding anyway.'}")
+    print(f"  {'✅ Logged in.' if logged_in else '⚠️  Login unclear - proceeding anyway.'}")
+
+    if warm_up:
+        # Step 1: Visit dashboard to seed all base session cookies
+        print("  🔥 Warm-up: visiting dashboard...")
+        try:
+            session.get(f"{LMS_BASE}/my/", timeout=REQUEST_TIMEOUT)
+        except Exception as ex:
+            print(f"  ⚠️  Dashboard warm-up failed (non-fatal): {ex}")
+
+        # Step 2: Hit the attendance URL once so the server sets its
+        # specific cookies/session data before our actual scrape call
+        print(f"  🔥 Warm-up: priming attendance URL...")
+        try:
+            session.get(ATTENDANCE_URL, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        except Exception as ex:
+            print(f"  ⚠️  Attendance prime failed (non-fatal): {ex}")
+
     return session
 
 
@@ -466,89 +483,45 @@ def _parse_attendance_table(soup: BeautifulSoup) -> dict | None:
             "total_attended": total_attended, "total_pct": total_pct}
 
 
-def _try_attendance_url(session: requests.Session, url: str, result_box: list, tried: set) -> None:
-    """Worker: try one URL; put result in result_box[0] if successful."""
-    if url in tried or result_box:  # another thread already found it
-        return
-    tried.add(url)
-    print(f"  🌐 Trying: {url}")
+def fetch_attendance(session: requests.Session) -> dict | None:
+    """
+    Fetch attendance from the confirmed working URL.
+    The session passed in should already be warmed-up (warm_up=True login)
+    so all cookies are properly set before this request.
+    """
+    print(f"  🌐 Fetching attendance: {ATTENDANCE_URL}")
     try:
-        r    = session.get(url, timeout=ATTENDANCE_TIMEOUT)
+        r    = session.get(ATTENDANCE_URL, timeout=ATTENDANCE_TIMEOUT)
         soup = BeautifulSoup(r.text, "html.parser")
 
+        # Check if we got redirected to login
         if _is_login_page(soup, r.url):
-            print(f"  🔄 Login redirect at {url}")
-            return  # handled by serial re-login below if all threads fail
+            print("  ⚠️  Attendance redirected to login page - session issue.")
+            print("    Trying one more time with a fresh warm-up session...")
+            fresh = login_to_lms(warm_up=True)
+            r    = fresh.get(ATTENDANCE_URL, timeout=ATTENDANCE_TIMEOUT)
+            soup = BeautifulSoup(r.text, "html.parser")
+            if _is_login_page(soup, r.url):
+                print("  ❌  Still on login page after retry. Cannot fetch attendance.")
+                return None
 
         data = _parse_attendance_table(soup)
         if data:
-            result_box.append(data)
-            return
+            return data
 
-        # No table — log snippet and try attendance sub-links
-        snippet = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:250]
-        print(f"  ⚠️  No table. Snippet: {snippet}")
-
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag.get("href", "")
-            text = a_tag.get_text(strip=True).lower()
-            if re.search(r"attendance", href + text, re.I):
-                link_url = href if href.startswith("http") else LMS_BASE + href
-                if link_url in tried: continue
-                tried.add(link_url)
-                print(f"  🔗 Following: {link_url}")
-                try:
-                    r2   = session.get(link_url, timeout=ATTENDANCE_TIMEOUT)
-                    s2   = BeautifulSoup(r2.text, "html.parser")
-                    data2 = _parse_attendance_table(s2)
-                    if data2:
-                        result_box.append(data2)
-                        return
-                except Exception as ex2:
-                    print(f"  ❌ Link error: {ex2}")
+        # No table found - print debug info
+        snippet = soup.get_text(" ", strip=True)
+        import re as _re
+        snippet = _re.sub(r"\s+", " ", snippet)[:400]
+        print(f"  ⚠️  No attendance table found. Page snippet: {snippet}")
+        print(f"  🔗  Final URL after redirects: {r.url}")
+        return None
 
     except Exception as ex:
-        print(f"  ❌ Error at {url}: {ex}")
-
-
-def fetch_attendance(session: requests.Session) -> dict | None:
-    """
-    Try all ATTENDANCE_URLS in parallel threads (each capped at ATTENDANCE_TIMEOUT).
-    Falls back to serial re-login retry if all redirect to login.
-    Total wall-clock time: ~ATTENDANCE_TIMEOUT seconds max (not N × timeout).
-    """
-    result_box: list = []
-    tried: set       = set()
-
-    threads = [
-        threading.Thread(target=_try_attendance_url, args=(session, url, result_box, tried), daemon=True)
-        for url in ATTENDANCE_URLS
-    ]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=ATTENDANCE_TIMEOUT + 2)
-
-    if result_box:
-        return result_box[0]
-
-    # All URLs either redirected to login or had no table — try re-login once
-    print("  🔄 All URLs failed or redirected — re-logging in for attendance…")
-    try:
-        fresh = login_to_lms()
-        result_box2: list = []
-        tried2: set       = set()
-        threads2 = [
-            threading.Thread(target=_try_attendance_url, args=(fresh, url, result_box2, tried2), daemon=True)
-            for url in ATTENDANCE_URLS
-        ]
-        for t in threads2: t.start()
-        for t in threads2: t.join(timeout=ATTENDANCE_TIMEOUT + 2)
-        if result_box2:
-            return result_box2[0]
-    except Exception as ex:
-        print(f"  ❌ Re-login attempt failed: {ex}")
-
-    print("  ❌ Could not fetch attendance from any URL.")
-    return None
+        import traceback
+        print(f"  ❌  Attendance fetch error: {ex}")
+        traceback.print_exc()
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -675,7 +648,7 @@ def send_attendance_to_discord(data: dict | None) -> None:
                 "1. Check the **GitHub Actions log** → look for `🌐 Trying:` lines\n"
                 "2. Find the `Page snippet:` for each URL to see what it returned\n"
                 "3. Log into LMS manually → open your attendance page → copy the URL\n"
-                "4. Add it as the **first entry** in `ATTENDANCE_URLS` in `lms_scraper.py`"
+                "4. Update `ATTENDANCE_URL` at the top of `lms_scraper.py` with the correct path"
             ),
             "color":     0xE74C3C,
             "footer":    {"text": f"Attendance Bot • SIU Hyderabad • {now_str}"},
@@ -778,7 +751,7 @@ def main():
     if run_attendance:
         print("\n📋 Scraping attendance…")
         try:
-            att_session = login_to_lms()
+            att_session = login_to_lms(warm_up=True)  # warm_up seeds all cookies before attendance fetch
             att_data    = fetch_attendance(att_session)
             count       = len(att_data["records"]) if att_data else 0
             print(f"  🔍 {count} records found.")
