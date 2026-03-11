@@ -102,30 +102,77 @@ def login_to_lms() -> requests.Session:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0 Safari/537.36"
-        )
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
     })
 
+    # ── Step 1: GET login page → grab logintoken ─────────────────
+    print(f"  🌐 Fetching login page: {LMS_LOGIN_URL}")
     r    = session.get(LMS_LOGIN_URL, timeout=20)
     soup = BeautifulSoup(r.text, "html.parser")
 
     token_tag  = soup.find("input", {"name": "logintoken"})
     logintoken = token_tag["value"] if token_tag else ""
+    print(f"  🔑 logintoken: {'found' if logintoken else 'NOT FOUND (will try without)'}")
 
-    r = session.post(
-        LMS_LOGIN_URL,
-        data={
-            "username":   LMS_USERNAME,
-            "password":   LMS_PASSWORD,
-            "logintoken": logintoken,
-            "anchor":     "",
-        },
-        timeout=20,
+    # ── Step 2: POST credentials ─────────────────────────────────
+    post_data = {
+        "username":   LMS_USERNAME,
+        "password":   LMS_PASSWORD,
+        "logintoken": logintoken,
+        "anchor":     "",
+        "rememberusername": "1",
+    }
+    r = session.post(LMS_LOGIN_URL, data=post_data, timeout=20, allow_redirects=True)
+
+    # ── Step 3: Verify — check for SUCCESS, not failure ──────────
+    # After a good login Moodle redirects to /my/ (dashboard)
+    # and the page contains logout link or user menu
+    final_url   = r.url
+    page_lower  = r.text.lower()
+    soup_after  = BeautifulSoup(r.text, "html.parser")
+
+    print(f"  🔗 Post-login URL: {final_url}")
+
+    # Explicit failure markers
+    has_error = (
+        'id="loginerrormessage"' in r.text
+        or 'class="loginerrormessage"' in r.text
+        or soup_after.find(id="loginerrormessage") is not None
+        or soup_after.find(class_="loginerrormessage") is not None
     )
 
-    if "loginerrormessage" in r.text or "invalid login" in r.text.lower():
-        raise RuntimeError("LMS login failed — check LMS_USERNAME / LMS_PASSWORD secrets.")
+    # Success markers — logged-in Moodle pages always have these
+    has_success = (
+        'data-loginurl' not in r.text           # login form gone
+        and (
+            "/my/" in final_url                 # redirected to dashboard
+            or "logout" in page_lower           # logout link present
+            or soup_after.find("a", {"data-title": "logout,moodle"}) is not None
+            or soup_after.find(attrs={"class": lambda c: c and "usermenu" in c}) is not None
+            or soup_after.find("div", {"id": "page-my-index"}) is not None
+        )
+    )
 
-    print("✅ Logged in to LMS.")
+    if has_error:
+        raise RuntimeError(
+            "❌ LMS login failed — Moodle returned an error message.\n"
+            "   Double-check LMS_USERNAME and LMS_PASSWORD secrets."
+        )
+
+    if not has_success:
+        # Ambiguous — still on login page? Print snippet for debugging
+        snippet = r.text[:800].replace("\n", " ")
+        print(f"  ⚠️  Login result unclear. Page snippet:\n  {snippet}\n")
+        # Don't hard-fail — attempt to continue; the forum fetches will
+        # naturally return empty/redirect if the session is really invalid
+        print("  ⚠️  Proceeding anyway — will fail gracefully if session is bad.")
+    else:
+        print("✅ Logged in to LMS successfully.")
+
     return session
 
 
