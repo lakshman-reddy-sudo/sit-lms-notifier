@@ -1,37 +1,66 @@
-name: 📢 LMS Announcement Notifier
+name: 📢 LMS Notifier
 
 on:
-  workflow_dispatch:   # ← Manual trigger from GitHub Actions tab
+  # ── Manual trigger (7-day announcement dump) ────────────────────
+  workflow_dispatch:
     inputs:
-      days:
+      fetch_attendance:
+        description: "Also fetch attendance? (true / false)"
+        required: false
+        default: "false"
+      lookback_days:
         description: "Days to look back for announcements"
         required: false
         default: "7"
 
+  # ── Hourly auto trigger (new announcements + attendance) ─────────
+  schedule:
+    - cron: "0 * * * *"   # every hour, on the hour (UTC)
+
 jobs:
   notify:
-    name: Fetch & Send LMS Announcements
+    name: Fetch & Send LMS Updates
     runs-on: ubuntu-latest
 
     steps:
+      # ── 1. Checkout ─────────────────────────────────────────────
       - name: 📥 Checkout repo
         uses: actions/checkout@v4
 
-      - name: 🐍 Set up Python
+      # ── 2. Python ────────────────────────────────────────────────
+      - name: 🐍 Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # ── 3. Dependencies ─────────────────────────────────────────
       - name: 📦 Install dependencies
         run: pip install requests beautifulsoup4 lxml
 
+      # ── 4. Determine run mode ───────────────────────────────────
+      #    workflow_dispatch  → manual
+      #    schedule           → auto
+      - name: ⚙️ Set run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_MODE=manual"         >> $GITHUB_ENV
+            echo "FETCH_ATTENDANCE=${{ github.event.inputs.fetch_attendance }}" >> $GITHUB_ENV
+            echo "LOOKBACK_DAYS=${{ github.event.inputs.lookback_days }}"       >> $GITHUB_ENV
+          else
+            echo "RUN_MODE=auto"           >> $GITHUB_ENV
+            echo "FETCH_ATTENDANCE=true"   >> $GITHUB_ENV
+            echo "LOOKBACK_DAYS=0"         >> $GITHUB_ENV
+          fi
+
+      # ── 5. Run notifier ─────────────────────────────────────────
       - name: 🚀 Run LMS Notifier
         env:
-          # ── LMS Credentials ──────────────────────────
+          # ── Credentials ───────────────────────────────────────
           LMS_USERNAME: ${{ secrets.LMS_USERNAME }}
           LMS_PASSWORD: ${{ secrets.LMS_PASSWORD }}
 
-          # ── Subject Webhooks ─────────────────────────
+          # ── Subject webhooks ──────────────────────────────────
           WEBHOOK_CAREER_ESSENTIALS: ${{ secrets.WEBHOOK_CAREER_ESSENTIALS }}
           WEBHOOK_COMPUTER_ARCH:     ${{ secrets.WEBHOOK_COMPUTER_ARCH }}
           WEBHOOK_CREATIVE_THINKING: ${{ secrets.WEBHOOK_CREATIVE_THINKING }}
@@ -43,7 +72,7 @@ jobs:
           WEBHOOK_SOFTWARE_ENG:      ${{ secrets.WEBHOOK_SOFTWARE_ENG }}
           WEBHOOK_TPCS:              ${{ secrets.WEBHOOK_TPCS }}
 
-          # ── Attendance Webhook ────────────────────────
-          WEBHOOK_ATTENDANCE:        ${{ secrets.WEBHOOK_ATTENDANCE }}
+          # ── Attendance webhook ────────────────────────────────
+          WEBHOOK_ATTENDANCE: ${{ secrets.WEBHOOK_ATTENDANCE }}
 
         run: python lms_scraper.py
