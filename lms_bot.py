@@ -61,17 +61,59 @@ def login():
     print("[OK] Logged in.")
 
 
+def _extract_userid(text):
+    """Try multiple patterns Moodle uses across different versions/themes."""
+    patterns = [
+        r'"userid"\s*:\s*(\d+)',         # JSON: "userid":123
+        r'"id"\s*:\s*(\d+)',             # JSON: "id":123
+        r'data-userid=["\'](\d+)["\']', # HTML attr: data-userid="123"
+        r'"user":\{"id":(\d+)',          # Nested: "user":{"id":123
+        r'userid=(\d+)',                 # URL param: userid=123
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1), pattern
+    return None, None
+
+
 def get_sesskey_and_userid():
     page = session.get(f"{LMS_URL}/my/")
     text = page.text
+
     if '"sesskey":"' not in text:
         raise RuntimeError("Could not get sesskey — login may have failed silently.")
     sesskey = text.split('"sesskey":"')[1].split('"')[0]
-    # userid is in the page as "userid":XXXXX
-    if '"userid":' not in text:
-        raise RuntimeError("Could not get userid from page.")
-    userid = text.split('"userid":')[1].split(',')[0].strip()
-    print(f"[OK] Got sesskey and userid: {userid}")
+
+    # Try extracting userid from the dashboard page
+    userid, matched_pattern = _extract_userid(text)
+
+    if userid:
+        print(f"[OK] Got sesskey and userid ({userid}) via pattern: {matched_pattern!r}")
+    else:
+        # Fallback: try the profile page
+        print("[INFO] userid not found on /my/ — trying profile page...")
+        profile_page = session.get(f"{LMS_URL}/user/profile.php")
+        userid, matched_pattern = _extract_userid(profile_page.text)
+
+        if userid:
+            print(f"[OK] Got userid ({userid}) from profile page.")
+        else:
+            # Last resort: try the preferences page
+            print("[INFO] userid not found on profile — trying preferences page...")
+            prefs_page = session.get(f"{LMS_URL}/user/preferences.php")
+            userid, matched_pattern = _extract_userid(prefs_page.text)
+
+            if userid:
+                print(f"[OK] Got userid ({userid}) from preferences page.")
+            else:
+                snippet = text[text.find("sesskey"):text.find("sesskey") + 400] if "sesskey" in text else text[:400]
+                print(f"[DEBUG] Page snippet near sesskey:\n{snippet}")
+                raise RuntimeError(
+                    "Could not extract userid from any page. "
+                    "See [DEBUG] snippet above — paste it here so we can find the right pattern."
+                )
+
     return sesskey, userid
 
 
@@ -80,11 +122,7 @@ def get_sesskey_and_userid():
 def ws_call(sesskey, methodname, args):
     """Call a single Moodle web service method via the AJAX endpoint."""
     url = f"{LMS_URL}/lib/ajax/service.php?sesskey={sesskey}"
-    payload = [{
-        "index": 0,
-        "methodname": methodname,
-        "args": args
-    }]
+    payload = [{"index": 0, "methodname": methodname, "args": args}]
     r = session.post(url, json=payload)
     r.raise_for_status()
     result = r.json()
@@ -99,16 +137,12 @@ def ws_call(sesskey, methodname, args):
 
 def get_enrolled_courses(sesskey, userid):
     data = ws_call(sesskey, "core_enrol_get_users_courses", {"userid": int(userid)})
-    if not data:
-        return []
-    return data  # list of {id, fullname, ...}
+    return data or []
 
 
 def get_forums_for_courses(sesskey, course_ids):
     data = ws_call(sesskey, "mod_forum_get_forums_by_courses", {"courseids": course_ids})
-    if not data:
-        return []
-    return data  # list of {id, course, name, type, ...}
+    return data or []
 
 
 def get_discussions(sesskey, forum_id):
@@ -117,7 +151,7 @@ def get_discussions(sesskey, forum_id):
         "sortby": "timemodified",
         "sortdirection": "DESC",
         "page": 0,
-        "perpage": 10
+        "perpage": 10,
     })
     if not data:
         return []
@@ -168,8 +202,8 @@ def main():
     sesskey, userid = get_sesskey_and_userid()
     cache = load_cache()
 
-    # Step 1: get all enrolled courses, filter to CSE_II SEM only
-    all_courses = get_enrolled_courses(sesskey, userid)
+    # Step 1: get enrolled courses, filter to CSE_II SEM only
+    all_courses    = get_enrolled_courses(sesskey, userid)
     target_courses = [c for c in all_courses if is_target_course(c.get("fullname", ""))]
 
     print(f"[INFO] Found {len(target_courses)} CSE_II SEM course(s) out of {len(all_courses)} total.")
@@ -181,11 +215,9 @@ def main():
         return
 
     # Step 2: get announcement forums for those courses
-    course_ids = [c["id"] for c in target_courses]
-    course_map = {c["id"]: c["fullname"] for c in target_courses}
-
-    all_forums = get_forums_for_courses(sesskey, course_ids)
-    # Moodle marks the announcements forum with type="news"
+    course_ids     = [c["id"] for c in target_courses]
+    course_map     = {c["id"]: c["fullname"] for c in target_courses}
+    all_forums     = get_forums_for_courses(sesskey, course_ids)
     announce_forums = [f for f in all_forums if f.get("type") == "news"]
 
     print(f"[INFO] Found {len(announce_forums)} announcement forum(s).")
@@ -199,12 +231,11 @@ def main():
             "─────────────────────────"
         )
 
-    # Step 3: fetch discussions (posts) from each forum
+    # Step 3: fetch discussions from each announcement forum
     for forum in announce_forums:
         forum_id    = forum["id"]
         course_id   = forum.get("course")
         course_name = course_map.get(course_id, "Unknown Course")
-
         discussions = get_discussions(sesskey, forum_id)
 
         for d in discussions:
