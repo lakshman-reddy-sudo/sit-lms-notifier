@@ -1,0 +1,32 @@
+name: LMS Notifier
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+    - cron: '0 * * * *'
+
+jobs:
+
+  run:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          LMS_USER: ${{ secrets.LMS_USER }}
+          LMS_PASS: ${{ secrets.LMS_PASS }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: python lms_bot.py
