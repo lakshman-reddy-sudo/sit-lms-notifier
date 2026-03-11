@@ -219,7 +219,6 @@ def parse_moodle_date(raw: str) -> datetime | None:
 # ─────────────────────────────────────────────────────────────────
 def _extract_row_data(row) -> dict:
     """Pull title/url/date/author/replies from a single table row or div."""
-    # Title + link
     title_tag = (
         row.select_one("td.topic a")
         or row.select_one("td.subject a")
@@ -235,7 +234,6 @@ def _extract_row_data(row) -> dict:
     if not post_url.startswith("http"):
         post_url = LMS_BASE + post_url
 
-    # Date — crawl every <td> for a parseable date
     date_obj = None
     date_str = "Unknown date"
     for sel in ["td.lastpost", "td.created", "td.modified"]:
@@ -246,7 +244,6 @@ def _extract_row_data(row) -> dict:
                 date_str = date_obj.strftime("%d %b %Y, %I:%M %p")
                 break
     if not date_obj:
-        # Brute-force: check every td's text for a date pattern
         for td in row.find_all("td"):
             txt = td.get_text(" ", strip=True)
             d   = parse_moodle_date(txt)
@@ -255,15 +252,12 @@ def _extract_row_data(row) -> dict:
                 date_str = d.strftime("%d %b %Y, %I:%M %p")
                 break
 
-    # Author
     author_tag = (
         row.select_one("td.author a")
         or row.select_one(".author a")
         or row.select_one("td.userpicture + td a")
     )
     author  = author_tag.get_text(strip=True) if author_tag else "Unknown"
-
-    # Replies
     rep_td  = row.select_one("td.replies")
     replies = rep_td.get_text(strip=True) if rep_td else "—"
 
@@ -275,6 +269,79 @@ def _extract_row_data(row) -> dict:
         "author":   author,
         "replies":  replies,
     }
+
+
+def fetch_post_summary(session: requests.Session, post_url: str) -> tuple[str, str, str]:
+    """
+    Fetch the discuss.php page and extract:
+      - author name
+      - posted date string
+      - first ~300 chars of post body (clean text, no HTML)
+    Returns (author, date_str, summary)
+    """
+    try:
+        r    = session.get(post_url, timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # ── Author ────────────────────────────────────────────────
+        author = "Unknown"
+        for sel in [
+            ".author a", ".username a", ".fullname",
+            "[data-region='post'] .username",
+            ".forumpost .author a",
+            "address.author a",
+        ]:
+            tag = soup.select_one(sel)
+            if tag:
+                author = tag.get_text(strip=True)
+                break
+
+        # ── Date ─────────────────────────────────────────────────
+        date_str = "Unknown date"
+        for sel in [
+            ".author time", "time[datetime]",
+            ".forumpost .date", ".posted", ".lastpost time",
+            "[data-region='post'] .date",
+        ]:
+            tag = soup.select_one(sel)
+            if tag:
+                raw = tag.get("datetime", "") or tag.get_text(strip=True)
+                d   = parse_moodle_date(raw)
+                if d:
+                    date_str = d.strftime("%d %b %Y, %I:%M %p")
+                    break
+                elif raw:
+                    date_str = raw[:30]
+                    break
+
+        # ── Post body ────────────────────────────────────────────
+        summary = ""
+        for sel in [
+            ".posting",                          # classic Moodle
+            "[data-region='post-content-container']",
+            ".post-content-container",
+            ".forumpost .content .no-overflow",
+            ".forumpost .posting",
+            "div.message",
+        ]:
+            tag = soup.select_one(sel)
+            if tag:
+                # Strip inner images/links but keep text
+                for t in tag.find_all(["img", "script", "style"]):
+                    t.decompose()
+                text = tag.get_text(" ", strip=True)
+                text = re.sub(r"\s+", " ", text).strip()
+                if len(text) > 20:
+                    summary = text[:320]
+                    if len(text) > 320:
+                        summary += "…"
+                    break
+
+        return author, date_str, summary
+
+    except Exception as ex:
+        print(f"      ⚠️  Could not fetch post body: {ex}")
+        return "Unknown", "Unknown date", ""
 
 
 def fetch_announcements(session: requests.Session, forum_id: str, lookback_hours: int) -> list:
@@ -294,8 +361,7 @@ def fetch_announcements(session: requests.Session, forum_id: str, lookback_hours
     )
     print(f"    🔎 Strategy A rows found: {len(rows)}")
 
-    # ── Strategy B: nuclear — find ALL discuss.php links ─────────
-    # Works regardless of table/div layout used by this Moodle theme
+    # ── Strategy B: find ALL discuss.php links ────────────────────
     if not rows:
         all_links = soup.find_all("a", href=re.compile(r"forum/discuss\.php|mod/forum/discuss"))
         print(f"    🔎 Strategy B links found: {len(all_links)}")
@@ -313,41 +379,30 @@ def fetch_announcements(session: requests.Session, forum_id: str, lookback_hours
             if not title:
                 continue
 
-            # Walk up the DOM to find date text near this link
-            date_obj = None
-            date_str = "Unknown date"
-            parent   = a.parent
-            for _ in range(5):           # up to 5 levels up
-                if parent is None:
-                    break
-                txt = parent.get_text(" ", strip=True)
-                d   = parse_moodle_date(txt)
-                if d:
-                    date_obj = d
-                    date_str = d.strftime("%d %b %Y, %I:%M %p")
-                    break
-                parent = parent.parent
-
-            # Author — sibling/nearby text
-            author = "Unknown"
-            if a.parent:
-                sib_text = a.parent.get_text(" ", strip=True)
-                # Remove the title itself to isolate metadata
-                meta = sib_text.replace(title, "").strip()
-                if meta:
-                    author = meta[:40]
-
-            # In MANUAL mode: include even if date unknown (forum only shows recent posts)
-            # In AUTO mode:   require date within 1 hr
-            if RUN_MODE == "manual" or (date_obj and date_obj >= cutoff):
+            if RUN_MODE == "manual" or True:   # always collect, filter after summary fetch
                 results.append({
                     "title":    title,
                     "url":      post_url,
-                    "date":     date_obj or datetime.min,
-                    "date_str": date_str,
-                    "author":   author,
+                    "date":     None,
+                    "date_str": "Unknown date",
+                    "author":   "Unknown",
                     "replies":  "—",
+                    "summary":  "",
                 })
+
+        # Fetch summaries (cap at 9 to avoid slow runs)
+        for post in results[:9]:
+            author, date_str, summary = fetch_post_summary(session, post["url"])
+            post["author"]   = author
+            post["date_str"] = date_str
+            post["summary"]  = summary
+            # Re-parse date for auto-mode filtering
+            d = parse_moodle_date(date_str)
+            post["date"] = d or datetime.min
+
+        # Apply cutoff for auto mode
+        if RUN_MODE == "auto":
+            results = [p for p in results if p["date"] >= cutoff]
 
         results.sort(key=lambda x: x["date"], reverse=True)
         return results
@@ -361,18 +416,22 @@ def fetch_announcements(session: requests.Session, forum_id: str, lookback_hours
                 continue
 
             date_obj = data["date"]
-            # Manual: include posts even if date unreadable (forum is already scoped to recent)
-            # Auto:   must fall within cutoff
             if RUN_MODE == "manual":
                 include = True
             else:
                 include = date_obj is not None and date_obj >= cutoff
 
             if include:
+                data["summary"] = ""
                 results.append(data)
 
         except Exception as ex:
             print(f"    ⚠️  Skipped row: {ex}")
+
+    # Fetch post summaries for Strategy A results too
+    for post in results[:9]:
+        _, _, summary = fetch_post_summary(session, post["url"])
+        post["summary"] = summary
 
     results.sort(key=lambda x: (x["date"] or datetime.min), reverse=True)
     return results
@@ -593,21 +652,32 @@ def send_announcements_to_discord(webhook: str, subject: dict, posts: list) -> N
     embeds = [header]
     for post in posts[:9]:
         fields = []
+        meta_parts = []
         if post["author"] not in ("Unknown", "", "—"):
-            fields.append({"name": "👤 Author",  "value": post["author"],   "inline": True})
-        if post["date_str"] != "Unknown date":
-            fields.append({"name": "📅 Posted",  "value": post["date_str"], "inline": True})
-        if post["replies"] not in ("—", ""):
-            fields.append({"name": "💬 Replies", "value": post["replies"],  "inline": True})
+            meta_parts.append(f"👤 {post['author']}")
+        if post["date_str"] not in ("Unknown date", ""):
+            meta_parts.append(f"📅 {post['date_str']}")
+        if post["replies"] not in ("—", "", "0"):
+            meta_parts.append(f"💬 {post['replies']} repl{'y' if post['replies'] == '1' else 'ies'}")
 
-        embeds.append({
+        # Description = summary (post body preview) if available, else meta
+        description = ""
+        if post.get("summary"):
+            description = post["summary"]
+        if meta_parts:
+            description = "  •  ".join(meta_parts) + ("\n\n" + description if description else "")
+
+        embed = {
             "title":     f"📢 {post['title']}",
             "url":       post["url"],
             "color":     subject["color"],
-            "fields":    fields if fields else [{"name": "🔗 Link", "value": post["url"], "inline": False}],
             "footer":    {"text": f"{subject['emoji']} {subject['name']} • LMS Notifier"},
             "timestamp": datetime.utcnow().isoformat() + "Z",
-        })
+        }
+        if description:
+            embed["description"] = description
+
+        embeds.append(embed)
 
     # Send in chunks of 10 (Discord limit)
     for i in range(0, len(embeds), 10):
@@ -723,9 +793,8 @@ def main():
     print(f"🕐  Run time : {datetime.now().strftime('%d %b %Y  %H:%M:%S')}")
     print("=" * 60)
 
+    # ── Announcements (Session 1) ─────────────────────────────────
     session = login_to_lms()
-
-    # ── Announcements ────────────────────────────────────────────
     total_new = 0
     for subject in SUBJECTS:
         print(f"\n📚 [{subject['code']}] {subject['name']}")
@@ -737,18 +806,24 @@ def main():
         except Exception as ex:
             print(f"  ❌ Error: {ex}")
 
-    # ── Attendance ───────────────────────────────────────────────
-    # Always in AUTO mode; in MANUAL only if FETCH_ATTENDANCE=true
+    # ── Attendance (fresh Session 2 — avoids expiry after 10+ fetches) ──
     run_attendance = (RUN_MODE == "auto") or (
         os.environ.get("FETCH_ATTENDANCE", "false").lower() == "true"
     )
 
     if run_attendance:
-        print("\n📋 Scraping attendance...")
-        att_data = fetch_attendance(session)
-        count = len(att_data["records"]) if att_data else 0
-        print(f"  🔍 {count} subject records found.")
-        send_attendance_to_discord(att_data)
+        print("\n📋 Scraping attendance (fresh login)...")
+        try:
+            att_session = login_to_lms()   # brand-new session — guaranteed fresh
+            att_data    = fetch_attendance(att_session)
+            count       = len(att_data["records"]) if att_data else 0
+            print(f"  🔍 {count} subject records found.")
+            send_attendance_to_discord(att_data)
+        except Exception as ex:
+            import traceback
+            print(f"  ❌ Attendance failed: {ex}")
+            traceback.print_exc()
+            send_attendance_to_discord(None)
 
     print("\n" + "=" * 60)
     print(f"✅ Finished — {total_new} announcement(s) dispatched.")
