@@ -1,7 +1,7 @@
 name: 📢 LMS Notifier
 
 on:
-  # ── Manual trigger (7-day announcement dump) ────────────────────
+  # ── Manual trigger ───────────────────────────────────────────────
   workflow_dispatch:
     inputs:
       fetch_attendance:
@@ -13,33 +13,66 @@ on:
         required: false
         default: "7"
 
-  # ── Hourly auto trigger (new announcements + attendance) ─────────
+  # ── Hourly auto trigger ──────────────────────────────────────────
+  # GitHub Actions cron uses UTC. IST = UTC+5:30
+  # "0 * * * *" fires every hour on the hour (UTC)
+  # e.g. 8 PM IST = 14:30 UTC, 9 PM IST = 15:30 UTC
+  # NOTE: GitHub may delay scheduled runs by up to ~15 mins under load.
+  # NOTE: GitHub PAUSES scheduled workflows on repos with no activity
+  #       for 60 days. The keepalive job below prevents this.
   schedule:
-    - cron: "0 * * * *"   # every hour, on the hour (UTC)
+    - cron: "0 * * * *"   # every hour on the hour (UTC)
 
 jobs:
+  # ── Keepalive — prevents GitHub from pausing the schedule ────────
+  # Runs once a month and makes a dummy commit to keep the repo active.
+  keepalive:
+    name: 🔄 Keepalive (prevent schedule pause)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔄 Keepalive ping
+        run: |
+          # Only commit once per month (day 1 of month, hour 0 UTC)
+          DAY=$(date -u +%d)
+          HOUR=$(date -u +%H)
+          if [ "$DAY" = "01" ] && [ "$HOUR" = "00" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            echo "$(date -u)" > .keepalive
+            git add .keepalive
+            git commit -m "chore: keepalive [skip ci]" || echo "Nothing to commit"
+            git push
+          else
+            echo "Not keepalive day — skipping commit."
+          fi
+
+  # ── Main notifier job ─────────────────────────────────────────────
   notify:
     name: Fetch & Send LMS Updates
     runs-on: ubuntu-latest
 
     steps:
-      # ── 1. Checkout ─────────────────────────────────────────────
+      # 1. Checkout
       - name: 📥 Checkout repo
         uses: actions/checkout@v4
 
-      # ── 2. Python ────────────────────────────────────────────────
+      # 2. Python
       - name: 🐍 Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ── 3. Dependencies ─────────────────────────────────────────
+      # 3. Dependencies
       - name: 📦 Install dependencies
         run: pip install requests beautifulsoup4 lxml
 
-      # ── 4. Determine run mode ───────────────────────────────────
-      #    workflow_dispatch  → manual
-      #    schedule           → auto
+      # 4. Set run mode
       - name: ⚙️ Set run mode
         id: mode
         run: |
@@ -53,14 +86,12 @@ jobs:
             echo "LOOKBACK_DAYS=0"         >> $GITHUB_ENV
           fi
 
-      # ── 5. Run notifier ─────────────────────────────────────────
+      # 5. Run notifier
       - name: 🚀 Run LMS Notifier
         env:
-          # ── Credentials ───────────────────────────────────────
           LMS_USERNAME: ${{ secrets.LMS_USERNAME }}
           LMS_PASSWORD: ${{ secrets.LMS_PASSWORD }}
 
-          # ── Subject webhooks ──────────────────────────────────
           WEBHOOK_CAREER_ESSENTIALS: ${{ secrets.WEBHOOK_CAREER_ESSENTIALS }}
           WEBHOOK_COMPUTER_ARCH:     ${{ secrets.WEBHOOK_COMPUTER_ARCH }}
           WEBHOOK_CREATIVE_THINKING: ${{ secrets.WEBHOOK_CREATIVE_THINKING }}
@@ -72,7 +103,6 @@ jobs:
           WEBHOOK_SOFTWARE_ENG:      ${{ secrets.WEBHOOK_SOFTWARE_ENG }}
           WEBHOOK_TPCS:              ${{ secrets.WEBHOOK_TPCS }}
 
-          # ── Attendance webhook ────────────────────────────────
           WEBHOOK_ATTENDANCE: ${{ secrets.WEBHOOK_ATTENDANCE }}
 
         run: python lms_scraper.py
