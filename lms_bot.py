@@ -28,6 +28,9 @@ TARGET_COURSES = {
     "Technical and Professional Communication Skills (CSE_II SEM)",
 }
 
+DISCORD_LIMIT    = 2000
+TRUNCATION_NOTE  = "\n\n... *(message truncated — check LMS for full content)*"
+
 session = requests.Session()
 
 
@@ -77,7 +80,7 @@ def get_sesskey():
     if '"sesskey":"' not in page.text:
         raise RuntimeError("Could not get sesskey — login may have failed silently.")
     sesskey = page.text.split('"sesskey":"')[1].split('"')[0]
-    print(f"[OK] Got sesskey.")
+    print("[OK] Got sesskey.")
     return sesskey
 
 
@@ -89,7 +92,7 @@ def fetch_timeline(sesskey):
         "index": 0,
         "methodname": "core_calendar_get_action_events_by_timesort",
         "args": {
-            "limitnum": 50        # Fetch up to 50 events so nothing is missed
+            "limitnum": 50
         }
     }]
     r = session.post(url, json=payload)
@@ -109,19 +112,37 @@ def clean_html(html):
     return clean.strip()
 
 
+def truncate_for_discord(text, reserved_chars):
+    """Trim text so the full message fits within Discord's 2000 char limit."""
+    available = DISCORD_LIMIT - reserved_chars - len(TRUNCATION_NOTE)
+    if len(text) > available:
+        return text[:available] + TRUNCATION_NOTE
+    return text
+
+
 def format_discord_msg(course, title, message, attachments, tag=""):
     header = f"📢  **LMS ANNOUNCEMENT — CSE II SEM**  {tag}".strip()
+
+    # Build the frame without the message body to measure its size
+    frame_without_body = (
+        f"{header}\n\n\n"
+        f"📚  **Course:**\n{course}\n\n\n"
+        f"📌  **Title:**\n{title}\n\n\n"
+        f"💬  **Message:**\n"
+        f"\n\n\n"
+        f"📎  **Attachments:** {attachments}\n\n"
+        "─────────────────────────"
+    )
+
+    # Truncate message body to fit the remaining space
+    message = truncate_for_discord(message, len(frame_without_body))
+
     return (
-        f"{header}"
-        "\n\n\n"
-        f"📚  **Course:**\n{course}"
-        "\n\n\n"
-        f"📌  **Title:**\n{title}"
-        "\n\n\n"
-        f"💬  **Message:**\n{message}"
-        "\n\n\n"
-        f"📎  **Attachments:** {attachments}"
-        "\n\n"
+        f"{header}\n\n\n"
+        f"📚  **Course:**\n{course}\n\n\n"
+        f"📌  **Title:**\n{title}\n\n\n"
+        f"💬  **Message:**\n{message}\n\n\n"
+        f"📎  **Attachments:** {attachments}\n\n"
         "─────────────────────────"
     )
 
@@ -153,7 +174,7 @@ def main():
 
     for item in events:
         if "data" not in item:
-            print(f"[WARN] Skipping item with no 'data' key.")
+            print("[WARN] Skipping item with no 'data' key.")
             continue
 
         event_list = item["data"].get("events", [])
@@ -164,7 +185,7 @@ def main():
             course      = e.get("course", {}).get("fullname", "")
             key         = name + course
 
-            # Skip courses not in our whitelist
+            # Skip courses not in the whitelist
             if not is_target_course(course):
                 print(f"[SKIP] {course}")
                 continue
