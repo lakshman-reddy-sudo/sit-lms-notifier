@@ -4,12 +4,20 @@ on:
   # ── Manual trigger ───────────────────────────────────────────────
   workflow_dispatch:
     inputs:
-      fetch_attendance:
-        description: "Also fetch attendance? (true / false)"
+      mode:
+        description: "Run mode: auto (today's posts + attendance) or manual (custom lookback)"
         required: false
-        default: "false"
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - manual
+      fetch_attendance:
+        description: "[manual only] Also fetch attendance? (true / false)"
+        required: false
+        default: "true"
       lookback_days:
-        description: "Days to look back for announcements"
+        description: "[manual only] Days to look back for announcements"
         required: false
         default: "7"
 
@@ -77,9 +85,15 @@ jobs:
         id: mode
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "RUN_MODE=manual"         >> $GITHUB_ENV
-            echo "FETCH_ATTENDANCE=${{ github.event.inputs.fetch_attendance }}" >> $GITHUB_ENV
-            echo "LOOKBACK_DAYS=${{ github.event.inputs.lookback_days }}"       >> $GITHUB_ENV
+            MODE="${{ github.event.inputs.mode }}"
+            echo "RUN_MODE=${MODE}" >> $GITHUB_ENV
+            if [ "${MODE}" = "auto" ]; then
+              echo "FETCH_ATTENDANCE=true" >> $GITHUB_ENV
+              echo "LOOKBACK_DAYS=0"       >> $GITHUB_ENV
+            else
+              echo "FETCH_ATTENDANCE=${{ github.event.inputs.fetch_attendance }}" >> $GITHUB_ENV
+              echo "LOOKBACK_DAYS=${{ github.event.inputs.lookback_days }}"       >> $GITHUB_ENV
+            fi
           else
             echo "RUN_MODE=auto"           >> $GITHUB_ENV
             echo "FETCH_ATTENDANCE=true"   >> $GITHUB_ENV
