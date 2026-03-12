@@ -5,19 +5,19 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run mode: auto (today's posts + attendance) or manual (custom lookback)"
+        description: "Mode: 'today' = all of today's posts + attendance | 'manual' = custom N-day lookback"
         required: false
-        default: "auto"
+        default: "today"
         type: choice
         options:
-          - auto
+          - today
           - manual
       fetch_attendance:
-        description: "[manual only] Also fetch attendance? (true / false)"
+        description: "[manual only] Fetch attendance? (true/false)"
         required: false
         default: "true"
       lookback_days:
-        description: "[manual only] Days to look back for announcements"
+        description: "[manual only] Days to look back"
         required: false
         default: "7"
 
@@ -87,7 +87,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${{ github.event.inputs.mode }}"
             echo "RUN_MODE=${MODE}" >> $GITHUB_ENV
-            if [ "${MODE}" = "auto" ]; then
+            if [ "${MODE}" = "today" ]; then
               echo "FETCH_ATTENDANCE=true" >> $GITHUB_ENV
               echo "LOOKBACK_DAYS=0"       >> $GITHUB_ENV
             else
@@ -95,6 +95,7 @@ jobs:
               echo "LOOKBACK_DAYS=${{ github.event.inputs.lookback_days }}"       >> $GITHUB_ENV
             fi
           else
+            # Cron: auto mode, 1-hour window
             echo "RUN_MODE=auto"           >> $GITHUB_ENV
             echo "FETCH_ATTENDANCE=true"   >> $GITHUB_ENV
             echo "LOOKBACK_DAYS=0"         >> $GITHUB_ENV
