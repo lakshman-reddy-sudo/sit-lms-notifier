@@ -13,7 +13,7 @@ If you're a student at **Symbiosis Institute of Technology, Hyderabad**, you kno
 - You check each subject one by one — 10 subjects, 10 clicks, every single day
 
 This project fixes all of that. It's a **GitHub Actions bot** that:
-- Logs into your LMS every 2 hours automatically
+- Logs into your LMS every hour automatically
 - Scrapes new announcements from all 10 subjects
 - Pulls your consolidated attendance report
 - Sends everything to a **Discord server** with rich, formatted messages
@@ -24,17 +24,18 @@ Zero manual effort after setup. It just runs.
 
 ## ✨ What you get in Discord
 
-### 📬 Announcements (per subject channel)
-Every new announcement shows up with:
-- The full announcement body (not a summary — the whole thing)
+### 📬 Announcements (per subject bot)
+Each subject has its own Discord bot. New announcements show up with:
+- The post title as a clickable link directly to the LMS
 - Who posted it and when
-- A direct link to the LMS post
-- A friendly "all clear" message when there's nothing new that hour
+- A preview of the announcement body
+- In auto mode: **silent** when nothing new (no spam)
+- In manual mode: a friendly "all clear" message when there's nothing new
 
-### 📋 Attendance Report (every hour)
-A clean summary showing:
-- Attended / Total sessions for every subject
-- Your percentage, color-coded 🔴🟡🟢
+### 📋 Attendance Report (attendance bot)
+A clean embed showing every subject with:
+- Attended / Total sessions
+- Percentage, color-coded 🔴 🟡 🟢
 - **How many more classes you need to hit 75%** (if you're below)
 - **How many classes you can safely skip** (if you're above)
 - Overall totals across all subjects
@@ -45,50 +46,59 @@ A clean summary showing:
 
 ```
 sit-lms-notifier/
-├── lms_scraper.py          # Main script — login, scrape, send to Discord
-├── lms_notifier.yml        # GitHub Actions workflow (place in .github/workflows/)
-├── requirements.txt        # Python dependencies
-├── cache.json              # Tracks already-sent announcements (auto-managed)
-└── README.md               # This file
+├── lms_scraper.py               # Main script — login, scrape, send to Discord
+├── .github/
+│   └── workflows/
+│       └── lms_notifier.yml     # GitHub Actions workflow
+├── requirements.txt             # Python dependencies
+└── README.md                    # This file
 ```
 
 ---
 
-## 🚀 Setup Guide (step by step)
+## ⚙️ Run Modes
 
-This might look like a lot, but it's a one-time setup that takes about **15–20 minutes**. Follow each step carefully and you'll be done.
+The bot has three modes:
 
-### Step 1 — Fork or create the repo
+| Mode | Triggered by | What it does |
+|---|---|---|
+| **`auto`** | Hourly cron (automatic) | Checks last **1 hour** only — alerts you the moment something new is posted. Silent if nothing new. Always sends attendance. |
+| **`today`** | Manual → Run workflow | Fetches everything posted **since midnight IST** — your full day summary on demand. Always sends attendance. |
+| **`manual`** | Manual → Run workflow | Fetches last N days of announcements. Attendance optional. |
 
-Go to GitHub and create a **new private repository**. Private is important — your LMS credentials will be stored here as secrets, so never make it public.
+**The idea:** the hourly auto runs are a live alert system — you get pinged only when a teacher actually posts something new. Use **`today`** manually any time you want a full catch-up of everything from today.
 
-Clone it to your machine or just work directly on GitHub.
+---
+
+## 🚀 Setup Guide
+
+This is a one-time setup that takes about **15–20 minutes**.
+
+### Step 1 — Create the repo
+
+Go to GitHub and create a **new private repository**. Private is important — your LMS credentials will be stored here as secrets.
 
 ### Step 2 — Add the files
 
 Upload these files to the root of your repo:
 - `lms_scraper.py`
 - `requirements.txt`
-- `cache.json` (initial content: `[]`)
 
-Then create the folder `.github/workflows/` and upload `lms_notifier.yml` inside it.
+Create the folder `.github/workflows/` and upload `lms_notifier.yml` inside it.
 
-Your repo structure should look like:
 ```
 your-repo/
 ├── .github/
 │   └── workflows/
 │       └── lms_notifier.yml
 ├── lms_scraper.py
-├── requirements.txt
-└── cache.json
+└── requirements.txt
 ```
 
 ### Step 3 — Create your Discord server
 
-1. Open Discord and click the **+** button on the left sidebar to create a new server
-2. Name it something like **"LMS Notifier"**
-3. Create **one text channel per subject** plus one for attendance. You can name them whatever you like, e.g.:
+1. Open Discord → click **+** on the sidebar → create a new server (e.g. "LMS Notifier")
+2. Create **one text channel per subject** plus one for attendance:
    ```
    #career-essentials
    #computer-arch
@@ -105,34 +115,15 @@ your-repo/
 
 ### Step 4 — Create Discord webhooks
 
-For **each channel** (including attendance), you need to create a webhook:
+For **each channel** (11 total — 10 subjects + attendance):
 
 1. Right-click the channel → **Edit Channel**
 2. Go to **Integrations** → **Webhooks** → **New Webhook**
-3. Give it a name (e.g. "LMS Notifier") and optionally upload a bot profile picture
-4. Click **Copy Webhook URL** and save it somewhere temporarily
+3. Give it a name and click **Copy Webhook URL**
 
-You'll need **11 webhook URLs** total (10 subjects + 1 attendance).
+### Step 5 — Add GitHub Secrets
 
-### Step 5 — Customise `lms_scraper.py` for your subjects
-
-Open `lms_scraper.py` and find the `SUBJECTS` list near the top. Each subject has a `forum_id` — this is the ID from your LMS forum URL.
-
-To find your forum IDs:
-1. Log into your LMS at `https://lmssithyd.siu.edu.in`
-2. Go to a subject's announcements forum
-3. Look at the URL — it will look like `.../mod/forum/view.php?id=XXXX`
-4. The number after `id=` is your `forum_id`
-
-Update each subject's `forum_id` to match your own. The subject names, emojis, and colors can also be customised to your liking.
-
-### Step 6 — Add GitHub Secrets
-
-This is where you store sensitive info safely. Go to your GitHub repo:
-
-**Settings → Secrets and variables → Actions → New repository secret**
-
-Add each of these secrets one by one:
+Go to your repo: **Settings → Secrets and variables → Actions → New repository secret**
 
 | Secret Name | Value |
 |---|---|
@@ -150,86 +141,82 @@ Add each of these secrets one by one:
 | `WEBHOOK_TPCS` | Webhook URL for that channel |
 | `WEBHOOK_ATTENDANCE` | Webhook URL for the attendance channel |
 
-**Important:** Your credentials are stored as encrypted secrets — GitHub never exposes them in logs or to anyone else.
+Your credentials are stored as encrypted secrets — GitHub never exposes them in logs.
 
-### Step 7 — Test it manually
+### Step 6 — Test it manually
 
-Before waiting for the hourly schedule, trigger a manual run to make sure everything works:
+1. Go to your repo → **Actions** tab
+2. Click **📢 LMS Notifier** in the sidebar
+3. Click **Run workflow**
+4. Select mode: **`today`**, click **Run workflow**
 
-1. Go to your repo on GitHub
-2. Click **Actions** tab
-3. Click **📢 LMS Notifier** in the left sidebar
-4. Click **Run workflow** (top right)
-5. Set `fetch_attendance` to `true` and `lookback_days` to `7`
-6. Click **Run workflow**
+You should see announcements and attendance flowing into Discord within a minute or two.
 
-Watch the logs in real time. You should see announcements and attendance flowing into your Discord within a minute or two.
+### Step 7 — You're done! 🎉
 
-### Step 8 — You're done! 🎉
+The workflow runs **automatically every hour**. You don't need to do anything else.
 
-The workflow runs **automatically every 2 hours**. You don't need to do anything else. Sit back and let it work.
-
-> **Note:** GitHub Actions schedules are not perfectly on the hour — they can be delayed by 5–45 minutes depending on GitHub's server load. This is normal and expected on the free tier.
+> **Note:** GitHub Actions cron can be delayed by 5–45 minutes under load on the free tier. This is normal.
 
 ---
 
-## ⚙️ How it works (technical overview)
+## 🔧 How it works (technical overview)
 
 ```
-GitHub Actions (cron: every 2 hours)
-        │
-        ▼
+GitHub Actions
+    │
+    ├─ Cron (every hour) ──────────────── RUN_MODE = auto
+    │                                     LOOKBACK = last 1 hour
+    │
+    └─ Manual trigger
+          ├─ mode = today ──────────────── RUN_MODE = today
+          │                                LOOKBACK = since midnight IST
+          └─ mode = manual ─────────────── RUN_MODE = manual
+                                           LOOKBACK = last N days
+
 lms_scraper.py
-        │
-        ├─ login_to_lms()
-        │     └─ POST credentials to Moodle login endpoint
-        │        Warm-up: visits dashboard + attendance URL to seed session cookies
-        │
-        ├─ fetch_announcements()  [for each subject]
-        │     ├─ GET forum page → scrape discussion rows
-        │     ├─ For each new post → GET discuss.php → extract full body + author + date
-        │     └─ send_announcements_to_discord() → POST to webhook
-        │
-        └─ fetch_attendance()
-              ├─ GET attendance report page
-              ├─ Parse table → subject / total / attended / percentage
-              └─ send_attendance_to_discord() → POST to webhook
+    │
+    ├─ login_to_lms()          [Session 1 — for announcements]
+    │     └─ POST credentials to Moodle login
+    │
+    ├─ fetch_announcements()   [for each of 10 subjects]
+    │     ├─ GET forum/view.php → scrape discuss.php links
+    │     ├─ GET each discuss.php → extract title + body preview + author + date
+    │     └─ send_announcements_to_discord() → POST to subject webhook
+    │
+    └─ login_to_lms()          [Session 2 — fresh login for attendance]
+          └─ fetch_attendance()
+                ├─ GET attendance-report page → parse table
+                └─ send_attendance_to_discord() → POST to attendance webhook
 ```
 
-**Auto mode** (2 hourly cron): only sends announcements posted in the last 2 hours. Sends an "all clear" message per subject if nothing is new. Always sends attendance.
-
-**Manual mode** (workflow_dispatch): fetches announcements from the past N days (default 7). Attendance is optional via the `fetch_attendance` input.
+Two separate login sessions are used — one for announcements, one for attendance — to avoid session expiry after many page fetches.
 
 ---
 
 ## 🔧 Adapting for other SIU batches / colleges
 
-The script is built specifically for SIT-H. To adapt it:
+**Different subjects:** Update the `SUBJECTS` list in `lms_scraper.py` — change `name`, `code`, `forum_id`, and `webhook` for each subject.
 
-**Different subjects:** Update the `SUBJECTS` list in `lms_scraper.py` — change the `name`, `code`, `forum_id`, and `webhook` for each subject. Add or remove entries as needed.
+**Different college on Moodle:** Change `LMS_BASE` at the top of the script to your institution's Moodle URL.
 
-**Different college on Moodle:** Change `LMS_BASE` at the top of the script to your institution's Moodle URL. The login, forum scraping, and attendance parsing logic should work on any standard Moodle installation.
-
-**Different attendance URL:** Find your attendance page URL by logging in manually, navigating to your attendance report, and copying the URL from the browser. Update `ATTENDANCE_URL` at the top of the script.
+**Different attendance URL:** Log in manually, navigate to your attendance report, copy the URL from the browser, and update `ATTENDANCE_URL` in `lms_scraper.py`.
 
 ---
 
 ## 🐛 Troubleshooting
 
 **Attendance shows "Fetch Failed"**
-Go to GitHub Actions → open the latest run log → look for lines starting with `📋`. This will tell you what the parser found. Most likely your attendance URL is different — log in manually, open your attendance page, copy the URL, and update `ATTENDANCE_URL` in `lms_scraper.py`.
+Open the Actions run log and look for lines starting with `📋`. Update `ATTENDANCE_URL` in `lms_scraper.py` to match your actual attendance page URL.
 
 **No announcements showing up**
-Check that your `forum_id` values are correct. Log into LMS, open a subject's forum, check the URL for `?id=XXXX`. Also make sure the webhooks are correct and the channels exist.
+Check `forum_id` values — log into LMS, open a subject's forum, check the URL for `?id=XXXX`. Also verify webhook URLs are correct.
 
 **Login failed**
-Double-check `LMS_USERNAME` and `LMS_PASSWORD` in your GitHub secrets. Try logging into the LMS manually to confirm they work.
+Double-check `LMS_USERNAME` and `LMS_PASSWORD` in GitHub Secrets. Try logging in manually to confirm they work.
 
-**Cron not running**
-GitHub pauses scheduled workflows on repositories with no activity for 60 days. The workflow includes a monthly keepalive commit to prevent this. If it still gets paused, just open the Actions tab and re-enable it, or trigger a manual run.
-
-**"Settings Star this discussion" appearing in body**
-This is old cached output — update to the latest `lms_scraper.py` which strips this Moodle UI noise automatically.
+**Cron stopped running**
+GitHub pauses scheduled workflows after 60 days of repo inactivity. The workflow includes a monthly keepalive commit to prevent this. If it still pauses, open the Actions tab and re-enable it, or trigger a manual run.
 
 ---
 
@@ -241,14 +228,14 @@ beautifulsoup4
 lxml
 ```
 
-Installed automatically by the GitHub Actions workflow. No local installation needed.
+Installed automatically by GitHub Actions. No local setup needed.
 
 ---
 
 ## 🔒 Security
 
-- Your LMS credentials are stored as **GitHub Encrypted Secrets** — they are never visible in logs, to collaborators, or to GitHub itself
-- The script never stores or transmits your credentials anywhere other than directly to your institution's LMS login endpoint
+- LMS credentials are stored as **GitHub Encrypted Secrets** — never visible in logs or to anyone else
+- The script only sends credentials directly to your institution's LMS login endpoint
 
 ---
 
@@ -256,7 +243,7 @@ Installed automatically by the GitHub Actions workflow. No local installation ne
 
 Built by **Narala Lakshman Reddy** (CSE, SIT-H) out of frustration with missing announcements.
 
-If this helped you never miss a test or drop below 75% attendance — share it with your classmates. The more of us who use it, the happier we all are. 😄
+If this helped you never miss a test or drop below 75% — share it with your classmates. 😄
 
 ---
 
