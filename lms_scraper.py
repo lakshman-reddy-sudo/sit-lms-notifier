@@ -62,7 +62,6 @@ SUBJECTS = [
 ]
 
 ATTENDANCE_WEBHOOK = os.environ.get("WEBHOOK_ATTENDANCE", "")
-DEADLINES_WEBHOOK  = os.environ.get("WEBHOOK_DEADLINES", "")
 
 ALL_CLEAR_MSGS = [
     "You're all caught up! No new posts this hour. ✨",
@@ -778,71 +777,64 @@ def send_grades_to_discord(webhook: str, subject: dict, grades: list, cache: dic
     print(f"  ✅ Grades: {len(new_grades)} new")
 
 
-def send_deadlines_digest(all_deadlines: list) -> None:
-    """Daily digest of everything due in the next 7 days across all subjects."""
-    if not DEADLINES_WEBHOOK:
-        print("⚠️  WEBHOOK_DEADLINES not set — skipping digest."); return
+def send_deadlines_digest(subject: dict, assignments: list, quizzes: list) -> None:
+    """
+    Posts a daily deadline reminder to the subject's own channel.
+    Shows all assignments + quizzes due in the next 7 days.
+    Only sends if there's actually something due soon.
+    """
+    now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    today   = datetime.now().date()
+    items   = []
 
-    now_str  = datetime.now().strftime("%d %b %Y, %I:%M %p")
-    today    = datetime.now().date()
-    upcoming = []
+    for a in assignments:
+        d = days_until(a.get("due_date"))
+        if d is not None and -1 <= d <= 7:
+            items.append({**a, "_days": d, "_kind": "📝 Assignment"})
 
-    for item in all_deadlines:
-        due = item.get("due_date") or item.get("close_date")
-        if not due: continue
-        d = (due.date() - today).days
-        if -1 <= d <= 7:
-            upcoming.append({**item, "_days": d})
+    for q in quizzes:
+        d = days_until(q.get("close_date"))
+        if d is not None and -1 <= d <= 7:
+            items.append({**q, "_days": d, "_kind": "🧪 Quiz",
+                          "due_date": q.get("close_date"), "due_str": q.get("close_str","")})
 
-    if not upcoming:
-        _post_webhook(DEADLINES_WEBHOOK, {"embeds": [{
-            "title": "📅 Deadlines Digest",
-            "description": "🎉 Nothing due in the next 7 days. You're all clear!",
-            "color": 0x2ECC71,
-            "footer": {"text": f"LMS Notifier • {now_str}"},
-            "timestamp": datetime.utcnow().isoformat()+"Z",
-        }]})
-        print("📅 Deadlines digest: clear!"); return
+    if not items:
+        return   # nothing due — stay quiet, no all-clear spam
 
-    upcoming.sort(key=lambda x: x["_days"])
+    items.sort(key=lambda x: x["_days"])
     fields = []
-    for item in upcoming[:25]:
-        d    = item["_days"]
-        due  = item.get("due_date") or item.get("close_date")
-        subj = item.get("subject","")
-        emoji = item.get("emoji","📌")
-        kind  = "🧪 Quiz" if "open_date" in item else "📝 Assignment"
-        name  = item.get("title","Untitled")
-        if d < 0:    urgency = f"🔴 OVERDUE by {abs(d)} day(s)"
-        elif d == 0: urgency = "🚨 DUE TODAY"
-        elif d == 1: urgency = "⚠️ Tomorrow"
-        else:        urgency = f"📅 In {d} days"
+    for item in items[:10]:
+        d   = item["_days"]
+        due = item.get("due_date")
+        if d < 0:    urgency = f"🔴 **OVERDUE** by {abs(d)} day(s)"
+        elif d == 0: urgency = "🚨 **DUE TODAY**"
+        elif d == 1: urgency = "⚠️ **Tomorrow**"
+        else:        urgency = f"📅 In **{d}** days"
         fields.append({
-            "name":   f"{emoji} [{item.get('code','')}] {name}",
+            "name":   f"{item['_kind']} — {item['title']}",
             "value":  f"{urgency}  •  {fmt_date(due)}",
             "inline": False,
         })
 
-    overdue = sum(1 for x in upcoming if x["_days"] < 0)
-    today_c = sum(1 for x in upcoming if x["_days"] == 0)
-    soon    = sum(1 for x in upcoming if 1 <= x["_days"] <= 3)
-    color   = 0xE74C3C if overdue or today_c else (0xF39C12 if soon else 0x3498DB)
+    overdue = sum(1 for x in items if x["_days"] < 0)
+    today_c = sum(1 for x in items if x["_days"] == 0)
+    soon    = sum(1 for x in items if 1 <= x["_days"] <= 3)
+    color   = 0xE74C3C if overdue or today_c else (0xF39C12 if soon else subject["color"])
 
-    parts = [f"📌 **{len(upcoming)} deadline(s)** in the next 7 days"]
+    parts = [f"📌 **{len(items)} upcoming deadline(s)**"]
     if overdue: parts.append(f"🔴 {overdue} overdue")
     if today_c: parts.append(f"🚨 {today_c} due today")
-    if soon:    parts.append(f"⚠️ {soon} due within 3 days")
+    if soon:    parts.append(f"⚠️ {soon} within 3 days")
 
-    # @everyone ping if anything is due today or overdue
-    payload = {"embeds": [{"title": "📅 Deadlines Digest — SIU Hyderabad",
-                            "description": "  •  ".join(parts),
-                            "color": color, "fields": fields,
-                            "footer": {"text": f"LMS Notifier • {now_str}"},
-                            "timestamp": datetime.utcnow().isoformat()+"Z"}]}
-    if overdue or today_c:
-        payload["content"] = "@everyone"
-    _post_webhook(DEADLINES_WEBHOOK, payload)
-    print(f"📅 Deadlines digest: {len(upcoming)} item(s).")
+    _post_webhook(subject["webhook"], {"embeds": [{
+        "title":       f"📅 Deadlines — {subject['name']}",
+        "description": "  •  ".join(parts),
+        "color":       color,
+        "fields":      fields,
+        "footer":      {"text": f"{subject['emoji']} {subject['name']} • LMS Notifier • {now_str}"},
+        "timestamp":   datetime.utcnow().isoformat()+"Z",
+    }]})
+    print(f"  📅 Deadlines reminder sent: {len(items)} item(s) for {subject['code']}")
 
 
 def send_attendance_to_discord(data: dict | None, cache: dict) -> None:
@@ -955,8 +947,7 @@ def main():
     session = login_to_lms()
     discover_course_ids(session)
 
-    total_new     = 0
-    all_deadlines = []
+    total_new = 0
 
     for subject in SUBJECTS:
         print(f"\n📚 [{subject['code']}] {subject['name']}")
@@ -974,26 +965,18 @@ def main():
             import traceback; print(f"  ❌ Announcements: {ex}"); traceback.print_exc()
 
         # Assignments
+        assignments = []
         try:
             assignments = fetch_assignments(session, cid)
-            new_a = send_assignments_to_discord(subject["webhook"], subject, assignments, cache)
-            all_deadlines.extend(new_a)
-            for a in assignments:
-                d = days_until(a.get("due_date"))
-                if d is not None and 0 <= d <= 7:
-                    all_deadlines.append({**a,"subject":subject["name"],"emoji":subject["emoji"],"code":subject["code"]})
+            send_assignments_to_discord(subject["webhook"], subject, assignments, cache)
         except Exception as ex:
             import traceback; print(f"  ❌ Assignments: {ex}"); traceback.print_exc()
 
         # Quizzes
+        quizzes = []
         try:
             quizzes = fetch_quizzes(session, cid)
-            new_q = send_quizzes_to_discord(subject["webhook"], subject, quizzes, cache)
-            all_deadlines.extend(new_q)
-            for q in quizzes:
-                d = days_until(q.get("close_date"))
-                if d is not None and 0 <= d <= 7:
-                    all_deadlines.append({**q,"subject":subject["name"],"emoji":subject["emoji"],"code":subject["code"]})
+            send_quizzes_to_discord(subject["webhook"], subject, quizzes, cache)
         except Exception as ex:
             import traceback; print(f"  ❌ Quizzes: {ex}"); traceback.print_exc()
 
@@ -1009,17 +992,11 @@ def main():
         except Exception as ex:
             import traceback; print(f"  ❌ Grades: {ex}"); traceback.print_exc()
 
-    # Deadlines digest
-    print("\n📅 Sending deadlines digest...")
-    try:
-        seen_urls, unique = set(), []
-        for item in all_deadlines:
-            u = item.get("url","")
-            if u not in seen_urls:
-                seen_urls.add(u); unique.append(item)
-        send_deadlines_digest(unique)
-    except Exception as ex:
-        import traceback; print(f"  ❌ Digest: {ex}"); traceback.print_exc()
+        # Deadlines reminder for this subject
+        try:
+            send_deadlines_digest(subject, assignments, quizzes)
+        except Exception as ex:
+            import traceback; print(f"  ❌ Deadlines: {ex}"); traceback.print_exc()
 
     # Attendance
     run_attendance = (RUN_MODE == "auto") or (os.environ.get("FETCH_ATTENDANCE","false").lower() == "true")
