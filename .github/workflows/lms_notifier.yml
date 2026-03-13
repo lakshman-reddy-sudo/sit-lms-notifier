@@ -83,6 +83,66 @@ jobs:
           WEBHOOK_TPCS:              ${{ secrets.WEBHOOK_TPCS }}
 
           WEBHOOK_ATTENDANCE: ${{ secrets.WEBHOOK_ATTENDANCE }}
+
+        run: python lms_scraper.py
+
+      # Commit updated cache.json so dedup works across runs
+      - name: 💾 Save cache back to repo
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add cache.json
+          git diff --staged --quiet || git commit -m "chore: update cache [skip ci]"
+          git push            git commit -m "chore: keepalive [skip ci]" || echo "Nothing to commit"
+            git push
+          fi
+
+  notify:
+    name: Fetch & Send LMS Updates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install dependencies
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: ⚙️ Set run mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_MODE=manual"         >> $GITHUB_ENV
+            echo "FETCH_ATTENDANCE=${{ github.event.inputs.fetch_attendance }}" >> $GITHUB_ENV
+            echo "LOOKBACK_DAYS=${{ github.event.inputs.lookback_days }}"       >> $GITHUB_ENV
+          else
+            echo "RUN_MODE=auto"           >> $GITHUB_ENV
+            echo "FETCH_ATTENDANCE=true"   >> $GITHUB_ENV
+            echo "LOOKBACK_DAYS=0"         >> $GITHUB_ENV
+          fi
+
+      - name: 🚀 Run LMS Notifier
+        env:
+          LMS_USERNAME: ${{ secrets.LMS_USERNAME }}
+          LMS_PASSWORD: ${{ secrets.LMS_PASSWORD }}
+
+          WEBHOOK_CAREER_ESSENTIALS: ${{ secrets.WEBHOOK_CAREER_ESSENTIALS }}
+          WEBHOOK_COMPUTER_ARCH:     ${{ secrets.WEBHOOK_COMPUTER_ARCH }}
+          WEBHOOK_CREATIVE_THINKING: ${{ secrets.WEBHOOK_CREATIVE_THINKING }}
+          WEBHOOK_EDA:               ${{ secrets.WEBHOOK_EDA }}
+          WEBHOOK_ENV_SUSTAIN:       ${{ secrets.WEBHOOK_ENV_SUSTAIN }}
+          WEBHOOK_LINEAR_ALGEBRA:    ${{ secrets.WEBHOOK_LINEAR_ALGEBRA }}
+          WEBHOOK_MICROCONTROLLERS:  ${{ secrets.WEBHOOK_MICROCONTROLLERS }}
+          WEBHOOK_PYTHON:            ${{ secrets.WEBHOOK_PYTHON }}
+          WEBHOOK_SOFTWARE_ENG:      ${{ secrets.WEBHOOK_SOFTWARE_ENG }}
+          WEBHOOK_TPCS:              ${{ secrets.WEBHOOK_TPCS }}
+
+          WEBHOOK_ATTENDANCE: ${{ secrets.WEBHOOK_ATTENDANCE }}
           WEBHOOK_DEADLINES:  ${{ secrets.WEBHOOK_DEADLINES }}
 
         run: python lms_scraper.py
