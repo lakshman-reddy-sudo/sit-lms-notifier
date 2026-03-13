@@ -72,7 +72,7 @@ ATTENDANCE_WEBHOOK = os.environ.get("WEBHOOK_ATTENDANCE", "")
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. LOGIN
 # ─────────────────────────────────────────────────────────────────────────────
-def login_to_lms() -> requests.Session:
+def login_to_lms(warm_up: bool = False) -> requests.Session:
     session = requests.Session()
     session.headers.update({
         "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -113,6 +113,16 @@ def login_to_lms() -> requests.Session:
         print("  ✅ Logged in successfully.")
     else:
         print(f"  ⚠️  Login unclear (URL={final_url}). Proceeding anyway.")
+
+    if warm_up:
+        # Visit dashboard + first attendance URL to seed session cookies
+        print("  🔥 Warming up session…")
+        try:
+            session.get(f"{LMS_BASE}/my/", timeout=15)
+            session.get(ATTENDANCE_URLS[0], timeout=15)
+            print("  ✅ Warm-up done.")
+        except Exception as ex:
+            print(f"  ⚠️  Warm-up failed (non-fatal): {ex}")
 
     return session
 
@@ -724,7 +734,7 @@ def main():
     if run_attendance:
         print("\n📋 Scraping attendance (fresh login)…")
         try:
-            att_session = login_to_lms()
+            att_session = login_to_lms(warm_up=True)
             att_data    = fetch_attendance(att_session)
             count       = len(att_data["records"]) if att_data else 0
             print(f"  🔍 {count} subject records found.")
