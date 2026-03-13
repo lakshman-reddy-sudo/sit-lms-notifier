@@ -1,4 +1,43 @@
-[
-  "TinkerLab-ProjectPresentation Class-A Section is dueTinker Lab for Computer Science (CSE)",
-  "Submission of Assignment\u20131: Mini Project with IEEE Paper Submission(15 Marks) is dueExploratory Data Analysis (CSE_II SEM)"
-]
+{
+  "announcements": [
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=245",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=194",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=247",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=218",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=234",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=233",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=215",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=244",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=216",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=214",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=186",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=185",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=184",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=183",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=257",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=254",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=248",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=261",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=243",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=236",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=222",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=219",
+    "https://lmssithyd.siu.edu.in/mod/forum/discuss.php?d=172"
+  ],
+  "assignments": [],
+  "quizzes": [],
+  "files": [],
+  "grades": [],
+  "attendance": {
+    "Linear Algebra": 38.89,
+    "Microcontrollers and Sensors": 73.68,
+    "Exploratory Data Analysis": 84.62,
+    "Introduction to Environment and Sustainability": 83.33,
+    "Computer Architecture and Organization": 61.54,
+    "Software Engineering": 73.68,
+    "Python Programming": 89.47,
+    "Technical and Professional Communication Skills": 77.78,
+    "Creative Thinking": 71.43,
+    "Career Essentials - I": 66.67
+  }
+}
