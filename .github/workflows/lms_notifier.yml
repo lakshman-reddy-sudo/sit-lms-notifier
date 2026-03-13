@@ -1,34 +1,54 @@
 name: 📢 LMS Notifier
 
 on:
+  # ── Manual trigger ──────────────────────────────────────────────────────────
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Run mode"
+        required: false
+        default: "today"
+        type: choice
+        options:
+          - today
+          - manual
       fetch_attendance:
-        description: "Also fetch attendance? (true / false)"
+        description: "Also fetch attendance? (manual mode only)"
         required: false
         default: "false"
       lookback_days:
-        description: "Days to look back for announcements"
+        description: "Days to look back (manual mode only)"
         required: false
         default: "7"
 
+  # ── Hourly auto trigger ─────────────────────────────────────────────────────
+  # GitHub Actions cron uses UTC. IST = UTC+5:30
+  # "0 * * * *" fires every hour on the hour (UTC)
+  # NOTE: GitHub may delay scheduled runs by up to ~15–45 mins under load.
+  # NOTE: GitHub PAUSES scheduled workflows on repos with no activity for 60
+  #       days. The keepalive job below prevents this.
   schedule:
     - cron: "0 * * * *"   # every hour on the hour (UTC)
 
-permissions:
-  contents: write          # needed to commit cache.json back to repo
-
 jobs:
+  # ── Keepalive — prevents GitHub from pausing the schedule ──────────────────
   keepalive:
-    name: 🔄 Keepalive
+    name: 🔄 Keepalive (prevent schedule pause)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      - run: |
-          DAY=$(date -u +%d); HOUR=$(date -u +%H)
+
+      - name: 🔄 Keepalive ping
+        run: |
+          # Only commit once per month (day 1 of month, hour 0 UTC)
+          DAY=$(date -u +%d)
+          HOUR=$(date -u +%H)
           if [ "$DAY" = "01" ] && [ "$HOUR" = "00" ]; then
             git config user.name  "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -36,28 +56,35 @@ jobs:
             git add .keepalive
             git commit -m "chore: keepalive [skip ci]" || echo "Nothing to commit"
             git push
+          else
+            echo "Not keepalive day — skipping commit."
           fi
 
+  # ── Main notifier job ───────────────────────────────────────────────────────
   notify:
     name: Fetch & Send LMS Updates
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Checkout
       - name: 📥 Checkout repo
         uses: actions/checkout@v4
 
+      # 2. Python
       - name: 🐍 Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # 3. Dependencies
       - name: 📦 Install dependencies
         run: pip install requests beautifulsoup4 lxml
 
+      # 4. Set run mode
       - name: ⚙️ Set run mode
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "RUN_MODE=manual"         >> $GITHUB_ENV
+            echo "RUN_MODE=${{ github.event.inputs.mode }}"           >> $GITHUB_ENV
             echo "FETCH_ATTENDANCE=${{ github.event.inputs.fetch_attendance }}" >> $GITHUB_ENV
             echo "LOOKBACK_DAYS=${{ github.event.inputs.lookback_days }}"       >> $GITHUB_ENV
           else
@@ -66,6 +93,7 @@ jobs:
             echo "LOOKBACK_DAYS=0"         >> $GITHUB_ENV
           fi
 
+      # 5. Run notifier
       - name: 🚀 Run LMS Notifier
         env:
           LMS_USERNAME: ${{ secrets.LMS_USERNAME }}
@@ -85,13 +113,3 @@ jobs:
           WEBHOOK_ATTENDANCE: ${{ secrets.WEBHOOK_ATTENDANCE }}
 
         run: python lms_scraper.py
-
-      # Commit updated cache.json so dedup works across runs
-      - name: 💾 Save cache back to repo
-        if: always()
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add cache.json
-          git diff --staged --quiet || git commit -m "chore: update cache [skip ci]"
-          git push
